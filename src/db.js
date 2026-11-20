@@ -10,7 +10,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 
-const SCHEMA_VERSION = '3';
+const SCHEMA_VERSION = '4';
 const INIT_LOCK = 72747_2026; // advisory lock key so parallel cold starts don't race the setup
 
 // One statement per entry (no multi-statement strings: the pooler path uses the extended protocol).
@@ -99,8 +99,16 @@ const DDL = [
      UNIQUE (session_id, task_id))`,
   'CREATE INDEX IF NOT EXISTS activity_task ON wt.activity (task_id, last_at)',
   'CREATE INDEX IF NOT EXISTS activity_user ON wt.activity (user_id, last_at)',
+  // Title/description seen when Claude loaded a Jira ticket (e.g. the jira-pickup skill), kept
+  // by key so they're there even if the ticket isn't being tracked yet when it's fetched.
+  `CREATE TABLE IF NOT EXISTS wt.jira_details (
+     jira_key    text PRIMARY KEY,
+     title       text NOT NULL,
+     description text NOT NULL DEFAULT '',
+     source      text NOT NULL,
+     fetched_at  bigint NOT NULL)`,
 ];
-const TABLES = ['settings', 'users', 'sessions', 'statuses', 'tasks', 'task_events', 'activity'];
+const TABLES = ['settings', 'users', 'sessions', 'statuses', 'tasks', 'task_events', 'activity', 'jira_details'];
 
 const DEFAULT_STATUSES = [
   { name: 'To Do', color: '#64748b', category: 'todo', stuck_after_days: null },

@@ -481,7 +481,7 @@ export function createTracker(db, { now = () => Date.now(), jiraBaseUrl = null }
     // person says they're on it via start_ticket) - not on every prompt of the session that parked it.
     const resumes = source === 'claude' || (event === 'SessionStart' && sessionSource !== 'compact');
     const t = now();
-    const where = [label, branch ? `branch ${branch}` : null].filter(Boolean).join(', ');
+    const where = branch ? `Claude Code on branch ${branch}` : 'Claude Code';
 
     const result = await db.tx(async () => {
       const start = await startStatus();
@@ -494,6 +494,12 @@ export function createTracker(db, { now = () => Date.now(), jiraBaseUrl = null }
       if (inserted) {
         id = inserted.id;
         await insertEvent({ task_id: id, kind: 'created', to_status_id: start.id, to_user_id: user.id, actor_id: user.id, source, note: `Started in ${where}`, created_at: t });
+        // Details captured when the ticket was loaded from Jira before work started.
+        await db.run(
+          `UPDATE wt.tasks t SET title = c.title, description = c.description, details_source = c.source, details_fetched_at = c.fetched_at
+           FROM wt.jira_details c WHERE t.id = ? AND c.jira_key = t.jira_key`,
+          id
+        );
       } else {
         const task = await db.get('SELECT * FROM wt.tasks WHERE jira_key = ? FOR UPDATE', key);
         id = task.id;
@@ -520,20 +526,44 @@ export function createTracker(db, { now = () => Date.now(), jiraBaseUrl = null }
   }
 
   /** Title/description copied from Jira (or supplied by Claude when the server can't read Jira). */
+  /**
+   * Title/description from Jira ('jira': the server's own lookup or a captured Jira response)
+   * or supplied by Claude ('claude'). Jira wins over Claude. A ticket that isn't tracked yet
+   * (e.g. fetched by the pickup skill before its branch exists) is remembered and applied when
+   * work on it starts. Leaving description undefined keeps the existing one.
+   */
   async function setDetails(ref, { title, description, error }, source) {
-    const id = await findTaskId(ref);
-    const task = await db.get('SELECT details_source FROM wt.tasks WHERE id = ?', id);
+    const key = String(ref ?? '').trim().toUpperCase();
+    const id = await db.get('SELECT id FROM wt.tasks WHERE jira_key = ?', key).then((r) => r?.id);
     if (error) {
+      if (!id) return null;
       await db.run('UPDATE wt.tasks SET details_error = ?, details_fetched_at = ? WHERE id = ?', String(error).slice(0, 300), now(), id);
       return getTask(id);
     }
-    if (source === 'claude' && task.details_source === 'jira') return getTask(id); // Jira wins
+    const src = source === 'jira' ? 'jira' : 'claude';
     const t = requireText(title, 'title', 500);
-    const d = clean(description ?? '') || '';
-    await db.run(
-      'UPDATE wt.tasks SET title = ?, description = ?, details_source = ?, details_fetched_at = ?, details_error = NULL WHERE id = ?',
-      t, d.slice(0, 50000), source === 'jira' ? 'jira' : 'claude', now(), id
-    );
+    const d = description === undefined ? undefined : (clean(description ?? '') || '').slice(0, 50000);
+    const cached = await db.get('SELECT source FROM wt.jira_details WHERE jira_key = ?', key);
+    if (!(src === 'claude' && cached?.source === 'jira')) {
+      await db.run(
+        `INSERT INTO wt.jira_details (jira_key, title, description, source, fetched_at) VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT (jira_key) DO UPDATE SET title = EXCLUDED.title,
+           description = CASE WHEN ?::boolean THEN wt.jira_details.description ELSE EXCLUDED.description END,
+           source = EXCLUDED.source, fetched_at = EXCLUDED.fetched_at`,
+        await normalizeKey(key), t, d ?? '', src, now(), d === undefined
+      );
+    }
+    if (!id) return null;
+    const task = await db.get('SELECT details_source FROM wt.tasks WHERE id = ?', id);
+    if (src === 'claude' && task.details_source === 'jira') return getTask(id); // Jira wins
+    if (d === undefined) {
+      await db.run('UPDATE wt.tasks SET title = ?, details_source = ?, details_fetched_at = ?, details_error = NULL WHERE id = ?', t, src, now(), id);
+    } else {
+      await db.run(
+        'UPDATE wt.tasks SET title = ?, description = ?, details_source = ?, details_fetched_at = ?, details_error = NULL WHERE id = ?',
+        t, d, src, now(), id
+      );
+    }
     return getTask(id);
   }
 

@@ -18,7 +18,7 @@ const PY = process.env.PYTHON || 'python3';
 const HOOK = path.join(root, 'plugin/scripts/hook.py');
 const MCP = path.join(root, 'plugin/scripts/mcp_server.py');
 
-let jiraServer, trackerServer, tracker, base, teamKey, repo, otherRepo;
+let jiraServer, trackerServer, tracker, db, base, teamKey, repo, otherRepo;
 const jiraRequests = [];
 
 const ADF = {
@@ -78,7 +78,7 @@ before(async () => {
   });
   const jiraUrl = await listen(jiraServer);
   const made = createApp({ database: { memory: true }, jira: createJiraClient({ baseUrl: jiraUrl, email: 'bot@example.com', token: 'jira-test-token' }) });
-  ({ tracker } = await made.init());
+  ({ tracker, db } = await made.init());
   teamKey = (await tracker.getSettings()).team_key;
   trackerServer = http.createServer(made.app);
   base = await listen(trackerServer);
@@ -187,4 +187,104 @@ test('MCP server: clear message when the tracker is not configured', async () =>
   assert.equal(r.isError, true);
   assert.match(r.content[0].text, /isn't configured/);
   await client.close();
+});
+
+// ---- Capturing ticket details when Claude loads a Jira ticket (e.g. the jira-pickup skill) ----
+
+const issueJson = (key, summary, description) => JSON.stringify({ key, id: '10042', fields: { summary, description, status: { name: 'To Do' }, parent: { key: 'CAP-99', fields: { summary: 'Parent epic' } } } });
+
+async function jiraHook(toolResponse, toolInput = { cloudId: 'x', issueIdOrKey: 'CAP-1' }, toolName = 'mcp__plugin_dev-workflow_atlassian__getJiraIssue') {
+  return runPy([HOOK, 'jira'], JSON.stringify({ hook_event_name: 'PostToolUse', cwd: otherRepo, tool_name: toolName, tool_input: toolInput, tool_response: toolResponse }), {
+    PATH: process.env.PATH, HOME: process.env.HOME, CLAUDE_PLUGIN_OPTION_SERVER_URL: base, CLAUDE_PLUGIN_OPTION_TEAM_KEY: teamKey,
+  });
+}
+
+async function waitFor(fn, ms = 5000) {
+  const until = Date.now() + ms;
+  for (;;) {
+    const v = await fn();
+    if (v || Date.now() > until) return v;
+    await sleep(50);
+  }
+}
+
+test('jira hook: captures title + description from the Jira response, before the ticket is tracked', async () => {
+  // MCP result as content blocks with the issue JSON as text, ADF description, a nested parent issue.
+  const r = await jiraHook({ content: [{ type: 'text', text: issueJson('CAP-1', 'Fix invoice rounding', ADF) }] });
+  assert.equal(r.status, 0, r.stderr);
+  const out = JSON.parse(r.stdout);
+  assert.equal(out.hookSpecificOutput.hookEventName, 'PostToolUse');
+  assert.match(out.hookSpecificOutput.additionalContext, /saved CAP-1 "Fix invoice rounding".*start_ticket.*summary/);
+  const cached = await waitFor(() => db.get("SELECT * FROM wt.jira_details WHERE jira_key = 'CAP-1'"));
+  assert.equal(cached?.title, 'Fix invoice rounding');
+  assert.match(cached.description, /Users bounce between/);
+  assert.equal((await tracker.listTasks()).some((t) => t.key === 'CAP-1'), false, 'loading a ticket does not start tracking it');
+
+  // Work starts on its branch: the ticket appears with the captured details (no Jira lookup needed).
+  const capRepo = gitRepo('feature/CAP-1');
+  const ping = await runHook('ping', { cwd: capRepo, session_id: 'cap-1', hook_event_name: 'SessionStart', source: 'startup' });
+  assert.equal(ping.status, 0);
+  const t = await waitFor(async () => (await tracker.listTasks()).find((x) => x.key === 'CAP-1'));
+  assert.equal(t.title, 'Fix invoice rounding');
+  assert.equal(t.details_source, 'jira');
+  fs.rmSync(capRepo, { recursive: true, force: true });
+});
+
+test('jira hook: other response shapes, and non-issues are ignored quietly', async () => {
+  // Plain JSON string with a markdown description (responseContentFormat: markdown).
+  let r = await jiraHook(issueJson('CAP-2', 'Markdown one', '**Bold** text\n\n- item'), { issueIdOrKey: 'cap-2' });
+  assert.match(JSON.parse(r.stdout).hookSpecificOutput.additionalContext, /CAP-2/);
+  assert.equal((await waitFor(() => db.get("SELECT * FROM wt.jira_details WHERE jira_key = 'CAP-2'")))?.description, '**Bold** text\n\n- item');
+  // Array of content blocks, looked up by numeric id.
+  r = await jiraHook([{ type: 'text', text: issueJson('CAP-3', 'By id', null) }], { issueIdOrKey: '10042' });
+  assert.match(JSON.parse(r.stdout).hookSpecificOutput.additionalContext, /CAP-3/);
+  // Errors and unrelated payloads: exit 0, no output.
+  for (const bad of ['{"error":true,"statusCode":404}', 'Issue does not exist', { content: [{ type: 'text', text: 'not json' }] }, null]) {
+    r = await jiraHook(bad);
+    assert.equal(r.status, 0);
+    assert.equal(r.stdout, '');
+  }
+});
+
+test('ping: the title from the pickup skill\'s active.json fills in a ticket Jira gave us nothing for', async () => {
+  const actRepo = gitRepo('fix/ACT-5');
+  fs.mkdirSync(path.join(actRepo, '.claude', 'jira-state'), { recursive: true });
+  fs.writeFileSync(path.join(actRepo, '.claude', 'jira-state', 'active.json'), JSON.stringify({ key: 'ACT-5', summary: 'Title from active.json', branch: 'fix/ACT-5' }));
+  await runHook('ping', { cwd: actRepo, session_id: 'act-5', hook_event_name: 'SessionStart', source: 'startup' });
+  const t = await waitFor(async () => (await tracker.listTasks()).find((x) => x.key === 'ACT-5' && x.title));
+  assert.equal(t.title, 'Title from active.json');
+  fs.rmSync(actRepo, { recursive: true, force: true });
+});
+
+test('start_ticket records a starting summary that can be replaced at the end', async () => {
+  const client = new Client({ name: 'test', version: '1.0.0' });
+  await client.connect(new StdioClientTransport({
+    command: PY, args: [MCP],
+    env: { PATH: process.env.PATH, HOME: process.env.HOME, WORK_TRACKER_URL: base, WORK_TRACKER_KEY: teamKey, CLAUDE_PROJECT_DIR: otherRepo },
+    stderr: 'pipe',
+  }));
+  assert.match(client.getInstructions(), /start_ticket with the key and `summary`/);
+  const r = await client.callTool({ name: 'start_ticket', arguments: { ticket: 'CAP-2', summary: 'Rounding is off by a cent on multi-currency invoices; plan is to round once at the end.' } });
+  assert.match(r.content[0].text, /Added CAP-2 "Markdown one"/);
+  let t = await tracker.getTask('CAP-2');
+  assert.match(t.work_summary, /round once at the end/);
+  await client.callTool({ name: 'update_ticket_status', arguments: { ticket: 'CAP-2', status: 'Done', summary: 'Rounded once per invoice; added tests for EUR and INR.' } });
+  t = await tracker.getTask('CAP-2');
+  assert.equal(t.work_summary, 'Rounded once per invoice; added tests for EUR and INR.');
+  assert.equal(t.events.filter((e) => e.kind === 'summary').length, 2);
+  await client.close();
+});
+
+test('jira hook: Claude is nudged once per ticket per session, details are saved every time', async () => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'wt-data-'));
+  const run = (key, session) => runPy([HOOK, 'jira'], JSON.stringify({
+    hook_event_name: 'PostToolUse', session_id: session, cwd: otherRepo, tool_name: 'mcp__3a9e8094-de57-4b9e-b8d3-f1fbb4b2921c__getJiraIssue',
+    tool_input: { issueIdOrKey: key }, tool_response: issueJson(key, `Title ${key}`, 'body'),
+  }), { PATH: process.env.PATH, HOME: process.env.HOME, CLAUDE_PLUGIN_OPTION_SERVER_URL: base, CLAUDE_PLUGIN_OPTION_TEAM_KEY: teamKey, CLAUDE_PLUGIN_DATA: dataDir });
+  const first = await run('CAP-7', 's-a');
+  assert.match(JSON.parse(first.stdout).hookSpecificOutput.additionalContext, /Only if CAP-7 is the ticket the user is starting/);
+  assert.equal((await run('CAP-7', 's-a')).stdout, '', 'same ticket, same session: no second nudge');
+  assert.match((await run('CAP-7', 's-b')).stdout, /CAP-7/, 'new session: nudged again');
+  assert.ok(await waitFor(() => db.get("SELECT 1 AS x FROM wt.jira_details WHERE jira_key = 'CAP-7'")));
+  fs.rmSync(dataDir, { recursive: true, force: true });
 });

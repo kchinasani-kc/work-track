@@ -69,8 +69,17 @@ export function claudeRouter(tracker, { jira = null } = {}) {
   // Hook: a session is working on a ticket (key taken from the branch name).
   r.post('/activity', wrap(async (b) => {
     const out = await tracker.recordActivity(activityInput(b), 'hook');
+    // Title the pickup skill saved in .claude/jira-state/active.json (never overrides Jira data).
+    if (b.title && !out.task.title) await tracker.setDetails(out.task.key, { title: b.title }, 'claude').catch(() => {});
     await withDetails(out.task.key);
     return { created: out.created, task: brief(await tracker.getTask(out.task.key)) };
+  }));
+
+  // Hook: Claude just loaded a ticket from Jira (e.g. the jira-pickup skill via the Atlassian
+  // connector). Keep its title/description, even if nobody is working on it yet.
+  r.post('/jira-capture', wrap(async (b) => {
+    const task = await tracker.setDetails(b.ticket, { title: b.title, description: b.description ?? '' }, 'jira');
+    return { tracked: !!task, task: task ? brief(task) : null };
   }));
 
   // Tool: the person tells Claude which ticket they're on (e.g. working outside a ticket branch).
@@ -80,6 +89,8 @@ export function claudeRouter(tracker, { jira = null } = {}) {
     if (b.title && !(await tracker.getTask(out.task.key)).title) {
       await tracker.setDetails(out.task.key, { title: b.title, description: b.description }, 'claude');
     }
+    // Starting summary: what the ticket asks for and the plan. Updated when the work is done.
+    if (b.summary && String(b.summary).trim()) await tracker.setSummary(out.task.key, b.summary, out.person, 'claude');
     return { created: out.created, task: brief(await tracker.getTask(out.task.key)) };
   }));
 
@@ -132,7 +143,8 @@ export function claudeRouter(tracker, { jira = null } = {}) {
   r.post('/note', wrap(async (b) => ({ task: brief(await tracker.addComment(b.ticket, b.note, await actor(b), 'claude')) })));
   r.post('/details', wrap(async (b) => {
     await actor(b);
-    return { task: brief(await tracker.setDetails(b.ticket, { title: b.title, description: b.description }, 'claude')) };
+    const task = await tracker.setDetails(b.ticket, { title: b.title, description: b.description }, 'claude');
+    return { tracked: !!task, task: task ? brief(task) : null };
   }));
 
   r.use((req, res) => res.status(404).json({ error: 'not found' }));

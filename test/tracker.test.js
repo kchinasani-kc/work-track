@@ -205,3 +205,22 @@ test('app labels from raw hook hints', () => {
   assert.equal(appLabel({ entrypoint: 'cli', term_program: 'Apple_Terminal' }), 'Terminal');
   assert.equal(appLabel({}), 'Claude Code');
 });
+
+test('details for a ticket loaded before anyone works on it are kept and applied when work starts', async (t) => {
+  const { tracker, db } = await setup(t);
+  assert.equal(await tracker.setDetails('PROJ-70', { title: 'From Claude', description: 'c' }, 'claude'), null, 'not tracked yet');
+  assert.equal(await tracker.setDetails('PROJ-70', { title: 'From Jira', description: 'j' }, 'jira'), null);
+  await tracker.setDetails('PROJ-70', { title: 'Claude again' }, 'claude'); // never overrides Jira data
+  const r = await at(tracker, ravi, 'PROJ-70');
+  assert.equal(r.task.title, 'From Jira');
+  assert.equal(r.task.description, 'j');
+  assert.equal(r.task.details_source, 'jira');
+  // Title-only update (from the pickup skill's active.json) keeps the description.
+  await at(tracker, ravi, 'PROJ-71');
+  await tracker.setDetails('PROJ-71', { title: 'Jira title', description: 'Jira body' }, 'jira');
+  await tracker.setDetails('PROJ-71', { title: 'Newer Jira title' }, 'jira');
+  const t71 = await tracker.getTask('PROJ-71');
+  assert.equal(t71.title, 'Newer Jira title');
+  assert.equal(t71.description, 'Jira body');
+  assert.equal((await db.get('SELECT COUNT(*) AS n FROM wt.jira_details')).n, 2);
+});

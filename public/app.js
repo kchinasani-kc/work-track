@@ -14,7 +14,7 @@ const state = {
   publicUrl: null,
   pluginSource: null,
   route: 'board',
-  filters: { assignee: '', q: '', showDone: false, nowOnly: false, teamSort: 'wait', window: '30', agingAssignee: '' },
+  filters: { assignee: '', q: '', showDone: false, teamSort: 'wait', window: '30', agingAssignee: '' },
   lastLoaded: null,
   openTaskKey: null,
 };
@@ -84,10 +84,6 @@ function avatar(person, cls = '') {
 }
 function statusPill(s) {
   return h('span', { class: 'pill' }, h('span', { class: 'dot', style: { background: s.color } }), s.name);
-}
-function liveBadge(t) {
-  if (t.working_now) return h('span', { class: 'live', title: `Claude Code activity ${ago(t.last_activity_at)}` }, h('i'), `Now${t.last_app ? ` · ${t.last_app}` : ''}`);
-  return h('span', { class: 'via', title: 'Last Claude Code activity on this ticket' }, t.last_activity_at ? `${ago(t.last_activity_at)}${t.last_app ? ` · ${t.last_app}` : ''}` : '');
 }
 function waitText(task, cls = '') {
   const { level } = heat(task);
@@ -229,7 +225,6 @@ async function renderBoard() {
   if (f.q) params.set('q', f.q);
   if (f.showDone) { params.set('include_done', '1'); params.set('done_within_days', '14'); }
   let tasks = await api(`/tasks?${params}`);
-  if (f.nowOnly) tasks = tasks.filter((t) => t.working_now);
   const cols = activeStatuses().filter((s) => f.showDone || s.category !== 'done');
 
   let searchTimer;
@@ -240,7 +235,6 @@ async function renderBoard() {
         type: 'search', placeholder: 'Search key, title or summary', value: f.q, 'aria-label': 'Search tickets',
         oninput: (e) => { clearTimeout(searchTimer); searchTimer = setTimeout(() => { f.q = e.target.value.trim(); refreshView().then(() => { const s = $('#view input[type=search]'); s?.focus(); s?.setSelectionRange(s.value.length, s.value.length); }); }, 300); },
       }),
-      h('label', { class: 'check' }, h('input', { type: 'checkbox', checked: f.nowOnly, onchange: (e) => { f.nowOnly = e.target.checked; refreshView(); } }), 'Being worked on now'),
       h('label', { class: 'check' }, h('input', { type: 'checkbox', checked: f.showDone, onchange: (e) => { f.showDone = e.target.checked; refreshView(); } }), 'Show done (14 days)'),
       updatedLabel()));
 
@@ -255,14 +249,14 @@ async function renderBoard() {
   }));
 
   const wrap = h('div', null, head, board);
-  if (!tasks.length && !f.q && !f.assignee && !f.nowOnly) wrap.append(emptyHint());
+  if (!tasks.length && !f.q && !f.assignee) wrap.append(emptyHint());
   return wrap;
 }
 
 function card(t) {
   const { level } = heat(t);
   return h('button', {
-    class: `card ${level === 'hot' ? 'is-stuck' : ''} ${t.working_now ? 'is-live' : ''}`, type: 'button',
+    class: `card ${level === 'hot' ? 'is-stuck' : ''}`, type: 'button',
     'aria-label': `${t.key} ${titleOf(t)}. ${t.status.name} for ${fmt(t.time_in_status_ms)}${level === 'hot' ? ', stuck' : ''}. ${t.assignee?.name ?? 'Unassigned'}.`,
     onclick: () => openTask(t.key),
   },
@@ -275,8 +269,7 @@ function card(t) {
     meter(t),
     h('div', { class: 'card-foot' },
       avatar(t.assignee),
-      h('span', { class: 'name' }, t.assignee?.name ?? 'Unassigned'),
-      liveBadge(t)));
+      h('span', { class: 'name' }, t.assignee?.name ?? 'Unassigned')));
 }
 
 // ---------- team ----------
@@ -289,15 +282,13 @@ async function renderTeam() {
 
   const people = [...data.people].sort((a, b) => {
     if (f.teamSort === 'name') return (a.id === null) - (b.id === null) || a.name.localeCompare(b.name);
-    if (f.teamSort === 'now') return (!!b.working_on - !!a.working_on) || (b.last_seen_at ?? 0) - (a.last_seen_at ?? 0);
     return b.stuck - a.stuck || (b.oldest_open_ms ?? -1) - (a.oldest_open_ms ?? -1);
   });
 
-  const head = pageHead('Team', 'What each person is working on in Claude Code, and how long each ticket has been in its current status.',
+  const head = pageHead('Team', 'Each person’s open tickets, and how long each has been in its current status.',
     h('div', { class: 'toolbar' },
       h('select', { 'aria-label': 'Sort people', value: f.teamSort, onchange: (e) => { f.teamSort = e.target.value; refreshView(); } },
         h('option', { value: 'wait' }, 'Stuck and longest wait first'),
-        h('option', { value: 'now' }, 'Working right now first'),
         h('option', { value: 'name' }, 'By name')),
       updatedLabel()));
 
@@ -306,9 +297,6 @@ async function renderTeam() {
   const lanes = h('div', { class: 'lanes' }, people.map((p) => {
     const counts = data.statuses.filter((s) => p.counts[s.id]).map((s) =>
       h('span', { class: 'pill' }, h('span', { class: 'dot', style: { background: s.color } }), `${s.name} `, h('b', { class: 'mono' }, p.counts[s.id])));
-    const now = p.working_on
-      ? h('span', { class: 'live', title: `Last Claude Code activity ${ago(p.working_on.last_at)}` }, h('i'), `On ${p.working_on.jira_key} in ${p.working_on.app ?? 'Claude Code'} · ${ago(p.working_on.last_at)}`)
-      : p.id !== null ? h('span', { class: 'seen' }, p.last_seen_at ? `Last in Claude Code ${ago(p.last_seen_at)}${p.last_app ? ` · ${p.last_app}` : ''}` : 'Not seen in Claude Code yet') : null;
     return h('section', { class: 'lane', 'aria-label': p.name },
       h('div', { class: 'lane-head' },
         p.id === null ? avatar(null, 'lg') : avatar(p, 'lg'),
@@ -317,8 +305,7 @@ async function renderTeam() {
           h('span', null, h('b', null, p.open), ' open'),
           p.blocked ? h('span', null, h('b', null, p.blocked), ' blocked') : null,
           p.stuck ? h('span', { class: 'hot' }, h('b', null, p.stuck), ' stuck') : null,
-          h('span', null, h('b', null, p.done_last_7d), ' done in the last 7 days')),
-        h('span', { class: 'lane-now' }, now)),
+          h('span', null, h('b', null, p.done_last_7d), ' done in the last 7 days'))),
       counts.length ? h('div', { class: 'lane-counts' }, counts) : null,
       p.tasks.length
         ? h('div', { class: 'lane-tasks' }, p.tasks.map((t) => {
@@ -428,10 +415,6 @@ async function renderPeople() {
         h('div', { class: 'muted', style: { fontSize: '12px' } }, u.email)))),
     h('td', { class: 'hide-sm' }, u.role === 'manager' ? 'Manager' : 'Team member', !u.active ? h('div', { class: 'tag' }, 'Deactivated') : null),
     h('td', { class: 'num mono' }, u.open_tasks),
-    h('td', { class: 'hide-sm' },
-      u.working_on
-        ? h('span', { class: 'live' }, h('i'), `On ${u.working_on.jira_key} in ${u.working_on.app ?? 'Claude Code'}`)
-        : h('span', { class: 'muted', style: { fontSize: '13px' } }, u.last_seen_at ? `${ago(u.last_seen_at)}${u.last_app ? ` · ${u.last_app}` : ''}` : (u.role === 'manager' ? '–' : 'never'))),
     h('td', null, h('div', { class: 'row-actions' },
       h('button', { class: 'btn sm ghost', onclick: () => editPerson(u) }, 'Edit'),
       u.role === 'manager' ? h('button', { class: 'btn sm ghost', onclick: () => setPassword(u) }, u.has_password ? 'Change password' : 'Set password') : null,
@@ -443,7 +426,7 @@ async function renderPeople() {
   return h('div', null,
     pageHead('People', 'Team members appear here automatically, named by their git name and email, the first time their Claude Code reports work.'),
     h('div', { class: 'panel', style: { overflowX: 'auto', marginBottom: '16px' } }, h('table', { class: 'data' },
-      h('thead', null, h('tr', null, h('th', null, 'Person'), h('th', { class: 'hide-sm' }, 'Role'), h('th', { class: 'num' }, 'Open'), h('th', { class: 'hide-sm' }, 'Claude Code'), h('th'))),
+      h('thead', null, h('tr', null, h('th', null, 'Person'), h('th', { class: 'hide-sm' }, 'Role'), h('th', { class: 'num' }, 'Open'), h('th'))),
       h('tbody', null, rows))),
     h('div', { class: 'panel' }, h('div', { class: 'panel-head' }, h('h2', null, 'Add a manager'), h('span', { class: 'muted' }, 'Managers sign in to this dashboard')), form));
 }
@@ -503,9 +486,6 @@ async function renderConnect() {
     h('label', { class: 'field' }, h('span', null, 'Jira projects to track'),
       h('input', { type: 'text', name: 'jira_project_keys', value: s.jira_project_keys.join(', '), placeholder: 'e.g. PROJ, OPS' }),
       h('small', null, 'Only branches with these project keys are tracked, in upper or lower case. Empty: any uppercase key like PROJ-123 counts.')),
-    h('label', { class: 'field', style: { flex: '0 0 220px' } }, h('span', null, '“Working now” window (minutes)'),
-      h('input', { type: 'number', name: 'active_minutes', min: '1', max: '1440', value: s.active_minutes }),
-      h('small', null, 'How long after the last Claude Code activity someone still counts as on a ticket.')),
     h('button', { class: 'btn', type: 'submit' }, 'Save'));
 
   return h('div', null,
@@ -686,12 +666,12 @@ async function openTask(key) {
       t.stuck_after_days ? ` · limit ${daysLabel(t.stuck_after_days)} (${Math.round(frac * 100)}%)` : '',
       ` · first worked on ${ago(t.created_at)}`),
     h('span', { style: { width: '100%', display: 'flex', alignItems: 'center', gap: '8px' } },
-      avatar(t.assignee), h('span', null, t.assignee?.name ?? 'Unassigned'), liveBadge(t)));
+      avatar(t.assignee), h('span', null, t.assignee?.name ?? 'Unassigned')));
 
   const summary = h('div', null, h('p', { class: 'section-label' }, 'Work summary'),
     t.work_summary
       ? h('div', { class: 'summary-box' }, t.work_summary, h('div', { class: 'muted', style: { fontSize: '12px', marginTop: '6px' } }, `Written by Claude ${ago(t.summary_updated_at)}`))
-      : h('div', { class: 'muted' }, 'No summary yet. Claude writes one when the ticket is marked done.'));
+      : h('div', { class: 'muted' }, 'No summary yet. Claude writes one when the ticket is picked up from Jira, and replaces it with what was done at the end.'));
 
   const description = h('div', null, h('p', { class: 'section-label' }, `Description${t.details_source === 'jira' ? ' (from Jira)' : t.details_source === 'claude' ? ' (via Claude)' : ''}`),
     t.description ? h('div', { class: 'description' }, t.description) : h('div', { class: 'muted' }, t.title ? 'No description in Jira.' : 'Not loaded from Jira yet.'),
@@ -705,13 +685,6 @@ async function openTask(key) {
       s.name, s.visits > 1 ? h('span', { class: 'muted' }, ` (${s.visits} times)`) : null, s.current ? h('span', { class: 'muted' }, ' · now') : null,
       h('span', { class: 'wait' }, fmt(s.total_ms))))));
 
-  const sessions = h('div', null, h('p', { class: 'section-label' }, 'Claude Code sessions'),
-    t.sessions.length
-      ? h('table', { class: 'data compact' }, h('tbody', null, t.sessions.slice(0, 8).map((s) => h('tr', null,
-          h('td', null, s.person), h('td', null, s.app ?? '–', s.app_raw ? h('div', { class: 'muted', style: { fontSize: '11px' } }, s.app_raw) : null),
-          h('td', { class: 'hide-sm' }, s.repo ?? '', s.branch ? h('div', { class: 'card-key' }, s.branch) : null),
-          h('td', { class: 'num muted' }, ago(s.last_at))))))
-      : h('div', { class: 'muted' }, 'None recorded.'));
 
   // Timeline, newest first. For a status change, show how long the ticket had been in the previous status.
   const moves = t.events.filter((e) => e.kind === 'created' || e.kind === 'status');
@@ -749,7 +722,7 @@ async function openTask(key) {
       h('button', { class: 'btn sm ghost', onclick: closeDrawer, 'aria-label': 'Close' }, 'Close')),
     h('div', { class: 'drawer-body' },
       h('h2', { class: `drawer-title ${t.title ? '' : 'muted'}` }, titleOf(t)),
-      now, summary, description, breakdown, sessions, timeline));
+      now, summary, description, breakdown, timeline));
   document.body.append(scrim, drawer);
 }
 

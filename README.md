@@ -4,12 +4,12 @@ A small web app that shows a manager which Jira tickets each person is working o
 
 - **Jira is only read.** The tracker takes each ticket's key, title and description from Jira and never changes anything there.
 - **People come from git.** A person is their `git config user.name` and `user.email`.
-- **Claude Code reports the work.** A small Claude Code plugin notices the Jira ticket from the git branch, such as `feature/PROJ-123`. Claude then moves the ticket through the tracker's own statuses and writes a summary of the work when it's done. It works in the terminal, the Claude desktop app, and the VS Code and Cursor extensions.
+- **Claude Code reports the work.** A small Claude Code plugin notices the Jira ticket from the git branch, such as `feature/PROJ-123`. When Claude loads the ticket from Jira (for example with your `jira-pickup` skill), the plugin saves its title and description, and Claude writes a short starting summary. Claude then moves the ticket through the tracker's own statuses and replaces the summary with what was done at the end. It works in the terminal, the Claude desktop app, and the VS Code and Cursor extensions.
 
 The manager sees five pages:
 
-- **Board**: one column per status. Each card shows how long the ticket has been in that status, a bar that fills toward the status's "stuck" limit, and a green **Now** badge with the app while someone is actively on it.
-- **Team**: one lane per person. It shows what they're on right now and in which app, their open tickets with the wait on each, and what they finished in the last 7 days, with summaries.
+- **Board**: one column per status. Each card shows how long the ticket has been in that status, a bar that fills toward the status's "stuck" limit, and the work summary.
+- **Team**: one lane per person, with their open tickets, the wait on each, and what they finished in the last 7 days, with summaries.
 - **Waiting time**: for each status, the tickets waiting now, the longest current wait, and the average and median time spent there. Also start-to-done time and a list of stuck tickets.
 - **Statuses**: add, rename, recolour, reorder or archive statuses, and set how many days in each counts as stuck.
 - **Connect**: the team key and the copy-paste commands to set up each person.
@@ -34,7 +34,11 @@ The manager sees five pages:
 ```
 
 - **Hooks.** The plugin's hooks run on session start and on every prompt, in the background. They never slow Claude down, and they do nothing outside a ticket branch. At session start they also tell Claude which ticket the session is on.
-- **Tools.** The plugin's tools let Claude update the ticket. The server instructions tell Claude to do this on its own: move the ticket to review, blocked or done as the work goes, with a one-line note, and write a 2–4 sentence summary when it's done. Moving to a done status is refused without a summary.
+- **Ticket details from your Jira skill.** Whenever Claude loads a ticket with an Atlassian connector's `getJiraIssue` tool, as the `jira-pickup` skill does, a plugin hook reads the key, title and description from the response and sends them to the tracker.
+  - This happens even before the ticket's branch exists; the details are kept and shown as soon as work on it starts.
+  - The title the skill writes to `.claude/jira-state/active.json` is used as a backup.
+  - The hook also asks Claude to call `start_ticket` with a 1–2 sentence starting summary: what the ticket asks for and the plan.
+- **Tools.** The plugin's tools let Claude update the ticket. The server instructions tell Claude to do this on its own: move the ticket to review, blocked or done as the work goes, with a one-line note. Moving to a done status needs a new summary of what was actually done, which replaces the starting one.
 - **Attribution.** Every change is kept in an append-only history: who made it (their git identity), when, the note, and whether it came from Claude, from automatic detection, or from the dashboard. Waiting times are calculated from that history.
 
 ## Quick start (on your own computer)
@@ -103,7 +107,7 @@ The account only needs permission to browse the tracked projects. The tracker on
 
 Titles are fetched the first time a ticket appears and refreshed at most every 6 hours. There is also a **Reload from Jira** button on each ticket.
 
-Without these variables, the tracker asks each person's Claude for the title instead. If Claude can read Jira, for example with the Atlassian connector, it fills the title in. Otherwise the ticket shows its key until someone reloads it.
+Without these variables, titles and descriptions come from Claude Code: the plugin saves them whenever Claude loads the ticket from Jira (see **How it works**), and falls back to the title in the pickup skill's `active.json`. A ticket nobody has loaded from Jira shows only its key.
 
 ## Setting up each team member
 
@@ -169,7 +173,7 @@ The plugin tells Claude to keep things current on its own. People can also be di
 | Tool | What it does |
 | --- | --- |
 | `current_ticket` | The ticket this checkout's branch is on, with status, wait and summary |
-| `start_ticket` | Record work on a ticket when the branch has no key |
+| `start_ticket` | Record that work on a ticket is starting, with a starting summary (also for branches without the key) |
 | `update_ticket_status` | Move to another status with a note. Done statuses need `summary` |
 | `set_work_summary` | Save or replace the summary of the work done |
 | `add_ticket_note` | Progress note without a status change |
@@ -198,14 +202,12 @@ A ticket's history starts with a "started" entry when it is first worked on, and
 - **Waiting now**: open tickets in the status today, and how long each has been there.
 - **Average time spent / Median**: every stint in that status that ended inside the selected window.
 - **Start to done**: from first activity in Claude Code to entering a done status.
-- **Working now**: someone's Claude Code reported activity on the ticket within the last 30 minutes. The window is changeable on Connect.
 
 ## Things to know
 
 - **A parked ticket stays parked.** If Claude moves a ticket to a to-do status, it stays there for the rest of that session. It restarts when a new Claude Code session begins on the ticket's branch.
 - **Supabase's free tier pauses idle projects.** After about a week with no activity, the dashboard shows a "can't start" error until you restore the project in Supabase. Daily use keeps it awake; a paid plan never pauses.
 - **The team key is shared.** Anyone who has it can report work under any git email. Share it only with the team. **Make a new key** on Connect if it leaks; everyone then reinstalls with the new key.
-- **App names are best effort.** Claude Code doesn't document a way to tell its apps apart. The tracker reads the environment the plugin runs in, and keeps the raw values on each session in the ticket's details. In testing, the desktop app reported correctly. VS Code and Cursor haven't been checked yet.
 - **People are matched by exact git email.** Someone who commits with two emails shows up as two people. You can rename people, but not merge them.
 - **When someone else picks up a ticket**, for example a reviewer working on the same branch, the ticket moves to their lane, and the history records the hand-over.
 
@@ -249,6 +251,7 @@ npm run dev
 The tests cover:
 
 - time-in-status maths, the summary rule, custom statuses, project-key filtering, search and auth
+- ticket details captured before a ticket is tracked, then applied when work starts
 - two simultaneous first reports for a new ticket creating it exactly once
 - the HTTP auth guards: wrong team key, no session and wrong password are refused
 - the production database driver (postgres.js, as used with Supabase), run over the Postgres network protocol against an embedded Postgres
@@ -256,6 +259,7 @@ The tests cover:
   - the hook and tool server run against a live tracker and a fake read-only Jira
   - inside a throwaway git repo on a ticket branch
   - driven by the official MCP client
+  - the Jira-capture hook on the response shapes an Atlassian connector may return (JSON text, content blocks, rich-text or markdown descriptions, errors)
 
 To check the plugin on the Python that ships with macOS:
 

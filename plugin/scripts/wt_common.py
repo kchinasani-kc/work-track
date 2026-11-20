@@ -134,3 +134,109 @@ def log(message):
 def stderr(message):
     sys.stderr.write(message.rstrip() + "\n")
     sys.stderr.flush()
+
+
+# ---------- Jira data seen by Claude ----------
+
+ISSUE_KEY = re.compile(r"^[A-Z][A-Z0-9_]+-\d+$")
+
+
+def active_ticket_title(cwd, key):
+    """Title the dev-workflow pickup skill saved in .claude/jira-state/active.json, if it's this ticket."""
+    top = git(["rev-parse", "--show-toplevel"], cwd)
+    if not top:
+        return None
+    try:
+        with open(os.path.join(top, ".claude", "jira-state", "active.json")) as f:
+            data = json.load(f)
+        if str(data.get("key", "")).upper() == key and isinstance(data.get("summary"), str):
+            return data["summary"].strip() or None
+    except Exception:
+        return None
+    return None
+
+
+def adf_to_text(node):
+    """Flatten Atlassian Document Format (Jira's rich-text JSON) to plain text."""
+    if node is None:
+        return ""
+    if isinstance(node, str):
+        return node
+    if isinstance(node, list):
+        return "".join(adf_to_text(n) for n in node)
+    if not isinstance(node, dict):
+        return ""
+    kind = node.get("type")
+    kids = lambda: "".join(adf_to_text(c) for c in node.get("content") or [])  # noqa: E731
+    if kind == "text":
+        return node.get("text", "")
+    if kind == "hardBreak":
+        return "\n"
+    if kind in ("paragraph", "heading", "codeBlock"):
+        return kids() + "\n\n"
+    if kind == "bulletList":
+        return "\n".join("- " + adf_to_text(li).strip() for li in node.get("content") or []) + "\n\n"
+    if kind == "orderedList":
+        return "\n".join(f"{i + 1}. " + adf_to_text(li).strip() for i, li in enumerate(node.get("content") or [])) + "\n\n"
+    if kind in ("mention", "emoji"):
+        attrs = node.get("attrs") or {}
+        return attrs.get("text") or attrs.get("shortName") or ""
+    if kind in ("inlineCard", "blockCard"):
+        return (node.get("attrs") or {}).get("url", "")
+    if kind == "doc":
+        return re.sub(r"\n{3,}", "\n\n", kids()).strip()
+    return kids()
+
+
+def _dicts(obj, depth=0):
+    """Every dict inside obj, outermost first, parsing JSON text along the way (MCP results
+    usually carry the payload as text content)."""
+    if depth > 8:
+        return
+    if isinstance(obj, str):
+        s = obj.strip()
+        if s[:1] in "{[":
+            try:
+                yield from _dicts(json.loads(s), depth + 1)
+            except Exception:
+                pass
+        return
+    if isinstance(obj, dict):
+        yield obj
+        for v in obj.values():
+            yield from _dicts(v, depth + 1)
+    elif isinstance(obj, list):
+        for v in obj:
+            yield from _dicts(v, depth + 1)
+
+
+def jira_issue_from_tool(tool_input, tool_response):
+    """Key, title and description from a getJiraIssue tool call, or None if it isn't one."""
+    wanted = str((tool_input or {}).get("issueIdOrKey") or "").strip().upper()
+    for d in _dicts(tool_response):
+        fields = d.get("fields")
+        if not isinstance(fields, dict) or not isinstance(fields.get("summary"), str):
+            continue
+        key = str(d.get("key") or "").strip().upper()
+        if wanted and ISSUE_KEY.match(wanted) and key and key != wanted:
+            continue  # a linked issue nested inside the response (parent, subtask...)
+        key = key or wanted
+        if not ISSUE_KEY.match(key):
+            continue
+        desc = fields.get("description")
+        desc = adf_to_text(desc) if isinstance(desc, (dict, list)) else (desc if isinstance(desc, str) else "")
+        return {"key": key, "title": fields["summary"].strip(), "description": desc.strip()}
+    return None
+
+
+def describe_shape(obj, depth=0):
+    """Short structural description of a value, for the debug log (no content)."""
+    if depth > 3:
+        return "..."
+    if isinstance(obj, dict):
+        return "{" + ", ".join(f"{k}: {describe_shape(v, depth + 1)}" for k, v in list(obj.items())[:8]) + "}"
+    if isinstance(obj, list):
+        return f"[{describe_shape(obj[0], depth + 1) if obj else ''}]x{len(obj)}"
+    if isinstance(obj, str):
+        return f"str({len(obj)})"
+    return type(obj).__name__

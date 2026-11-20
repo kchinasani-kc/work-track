@@ -3,15 +3,39 @@
     "SessionStart": [
       {
         "hooks": [
-          { "type": "command", "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/hook.py\" context", "timeout": 10 },
-          { "type": "command", "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/hook.py\" ping", "async": true }
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/hook.py\" context",
+            "timeout": 10
+          },
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/hook.py\" ping",
+            "async": true
+          }
         ]
       }
     ],
     "UserPromptSubmit": [
       {
         "hooks": [
-          { "type": "command", "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/hook.py\" ping", "async": true }
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/hook.py\" ping",
+            "async": true
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "mcp__.*__getJiraIssue",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/hook.py\" jira",
+            "timeout": 15
+          }
         ]
       }
     ]

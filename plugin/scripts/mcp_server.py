@@ -20,8 +20,9 @@ SERVER_INFO = {"name": "work-tracker", "version": "1.0.0"}
 INSTRUCTIONS = """Work Tracker shows the team's manager which Jira tickets each person is working on in Claude Code, the status of each, and how long each has waited in each status. It only reads Jira; nothing in Jira is ever changed.
 
 - The ticket is detected automatically from the git branch name (e.g. feature/PROJ-123). If the user is working on a Jira ticket from a branch without the key, call start_ticket once with that key.
+- When you load a Jira ticket to start work on it (for example with the jira-pickup skill), its title and description are saved automatically. Then call start_ticket with the key and `summary`: 1-2 plain sentences on what the ticket asks for and the plan. That summary is shown to the manager from the start.
 - Keep the status current without being asked: when work is handed off for review, blocked, or finished, call update_ticket_status with a one-line note. When the user says they're blocked, record what they're waiting on in the note.
-- Moving a ticket to a done status needs a summary: 2-4 plain sentences for the manager on what was changed and anything left over. You can also refresh the summary at any time with set_work_summary.
+- At the end, replace the summary with what was actually done: moving a ticket to a done status needs `summary` (2-4 plain sentences for the manager on what was changed and anything left over). You can refresh it at any time with set_work_summary.
 - Statuses are customised by the manager; call list_statuses if unsure which exist.
 - If a ticket's title is missing and you can read Jira (for example with an Atlassian connector), read the ticket and pass its title and description to set_ticket_details. Never change anything in Jira for the tracker.
 - Only update tickets the user is actually working on or asked about."""
@@ -38,11 +39,12 @@ TOOLS = [
     },
     {
         "name": "start_ticket",
-        "description": "Record that the user is working on a Jira ticket (use when the branch name doesn't contain the key). Adds the ticket to the tracker if needed.",
+        "description": "Record that the user is starting or resuming work on a Jira ticket, with a starting summary. Adds the ticket to the tracker if needed. Use after loading a ticket from Jira, or when the branch name doesn't contain the key.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "ticket": TICKET,
+                "summary": {"type": "string", "description": "1-2 plain sentences on what the ticket asks for and the plan; shown to the manager until it's replaced with what was done"},
                 "title": {"type": "string", "description": "Ticket title from Jira, only if you already have it"},
                 "description": {"type": "string", "description": "Ticket description from Jira, only if you already have it"},
                 "repo_path": REPO_PATH,
@@ -209,7 +211,7 @@ def call_tool(name, args):
                 return f"Branch {branch} is ticket {key}, but it isn't in the tracker yet. Call start_ticket with {key}."
             raise
     if name == "start_ticket":
-        r = wt.post("/start", {"person": person(args), "ticket": args["ticket"], "title": args.get("title"), "description": args.get("description"), **where(args)})
+        r = wt.post("/start", {"person": person(args), "ticket": args["ticket"], "title": args.get("title"), "description": args.get("description"), "summary": args.get("summary"), **where(args)})
         t = r["task"]
         lead = "Added" if r.get("created") else "Recorded work on"
         msg = f"{lead} {t['key']} \"{t.get('title') or '(title not loaded)'}\" - status {t['status']}."
@@ -245,8 +247,10 @@ def call_tool(name, args):
             for s in r["statuses"]
         )
     if name == "set_ticket_details":
-        t = wt.post("/details", {"person": person(args), "ticket": args["ticket"], "title": args["title"], "description": args.get("description")})["task"]
-        return f"Saved title and description for {t['key']}."
+        r = wt.post("/details", {"person": person(args), "ticket": args["ticket"], "title": args["title"], "description": args.get("description")})
+        if not r.get("tracked"):
+            return f"Saved title and description for {args['ticket'].upper()}; they'll show once work on it starts."
+        return f"Saved title and description for {r['task']['key']}."
     raise wt.TrackerError(f"unknown tool {name}")
 
 
