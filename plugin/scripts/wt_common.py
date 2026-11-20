@@ -63,14 +63,6 @@ def current_branch(cwd):
     return None if b in (None, "HEAD") else b
 
 
-def repo_name(cwd):
-    remote = git(["config", "--get", "remote.origin.url"], cwd)
-    if remote:
-        return re.sub(r"\.git$", "", remote.rstrip("/").split("/")[-1].split(":")[-1])
-    top = git(["rev-parse", "--show-toplevel"], cwd)
-    return os.path.basename(top) if top else None
-
-
 def key_from_branch(branch, keep_case=False):
     """First Jira-looking key in a branch name. Upper-cased unless keep_case (the server then
     decides whether a lowercase match counts, based on the configured project keys)."""
@@ -80,16 +72,6 @@ def key_from_branch(branch, keep_case=False):
     if not m:
         return None
     return m.group(1) if keep_case else m.group(1).upper()
-
-
-def app_info():
-    """Raw hints about which app is running Claude Code; the server turns them into a label."""
-    return {
-        "entrypoint": os.environ.get("CLAUDE_CODE_ENTRYPOINT"),
-        "bundle": os.environ.get("__CFBundleIdentifier"),
-        "term_program": os.environ.get("TERM_PROGRAM"),
-        "cursor": bool(os.environ.get("CURSOR_TRACE_ID")),
-    }
 
 
 def post(path, body, timeout=20):

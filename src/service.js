@@ -55,36 +55,14 @@ function validColor(c) {
   return c.toLowerCase();
 }
 
+/** Time in days ("3 days", "less than a day"): this is a status tracker, not a stopwatch. */
 export function formatDuration(ms) {
   if (ms == null) return '';
-  const m = Math.floor(ms / 60000);
-  if (m < 1) return 'under a minute';
-  if (m < 60) return `${m}m`;
-  const h = Math.floor(m / 60);
-  if (h < 24) return `${h}h ${m % 60}m`;
-  const d = Math.floor(h / 24);
-  return `${d}d ${h % 24}h`;
+  const d = Math.floor(ms / 86_400_000);
+  if (d < 1) return 'less than a day';
+  return d === 1 ? '1 day' : `${d} days`;
 }
 
-/**
- * Turn the raw environment values a Claude Code hook sends into a readable app name.
- * Only `claude-desktop` is a confirmed entrypoint value; everything else is best effort,
- * and the raw string is kept alongside so it can be checked later.
- */
-export function appLabel(info = {}) {
-  const entry = String(info.entrypoint ?? '').toLowerCase();
-  const bundle = String(info.bundle ?? '').toLowerCase();
-  const term = String(info.term_program ?? '').toLowerCase();
-  const isCursor = bundle.includes('todesktop') || bundle.includes('cursor') || info.cursor === true;
-  const isVsCode = bundle.includes('com.microsoft.vscode');
-  if (entry === 'claude-desktop' || bundle === 'com.anthropic.claudefordesktop') return 'Claude desktop';
-  if (isCursor) return 'Cursor';
-  if (isVsCode || entry.includes('vscode')) return 'VS Code';
-  if (term === 'vscode') return 'VS Code';
-  if (entry === 'cli') return 'Terminal';
-  if (entry.startsWith('sdk')) return 'Claude Code (SDK)';
-  return 'Claude Code';
-}
 
 // ---------- tracker ----------
 
@@ -102,7 +80,6 @@ export function createTracker(db, { now = () => Date.now(), jiraBaseUrl = null }
     const s = Object.fromEntries(rows.map((r) => [r.key, r.value]));
     return {
       default_stuck_days: Number(s.default_stuck_days),
-      active_minutes: Number(s.active_minutes),
       jira_project_keys: (s.jira_project_keys || '').split(',').map((k) => k.trim()).filter(Boolean),
       team_key: s.team_key,
     };
@@ -117,11 +94,6 @@ export function createTracker(db, { now = () => Date.now(), jiraBaseUrl = null }
       const d = Number(patch.default_stuck_days);
       if (!Number.isFinite(d) || d < 0) throw new AppError('default stuck days must be 0 or more');
       await setSetting('default_stuck_days', String(d));
-    }
-    if (patch.active_minutes !== undefined) {
-      const m = Number(patch.active_minutes);
-      if (!Number.isFinite(m) || m < 1 || m > 24 * 60) throw new AppError('"working now" window must be between 1 and 1440 minutes');
-      await setSetting('active_minutes', String(m));
     }
     if (patch.jira_project_keys !== undefined) {
       const raw = Array.isArray(patch.jira_project_keys) ? patch.jira_project_keys : String(patch.jira_project_keys).split(',');
@@ -146,7 +118,7 @@ export function createTracker(db, { now = () => Date.now(), jiraBaseUrl = null }
 
   // ---- people ----
   const userCols = (p = '') =>
-    `${p}id, ${p}name, ${p}email, ${p}role, ${p}active, ${p}name_locked, ${p}last_seen_at, ${p}last_app, ${p}created_at, ${p}password_hash IS NOT NULL AS has_password`;
+    `${p}id, ${p}name, ${p}email, ${p}role, ${p}active, ${p}name_locked, ${p}created_at, ${p}password_hash IS NOT NULL AS has_password`;
   const USER_COLS = userCols();
 
   async function getUser(id) {
@@ -155,25 +127,13 @@ export function createTracker(db, { now = () => Date.now(), jiraBaseUrl = null }
     return u;
   }
 
-  async function activeWindowStart() {
-    return now() - (await getSettings()).active_minutes * 60_000;
-  }
-
   async function listUsers() {
-    const users = await db.all(
+    return db.all(
       `SELECT ${userCols('u.')},
          (SELECT COUNT(*) FROM wt.tasks t JOIN wt.statuses s ON s.id = t.status_id
             WHERE t.assignee_id = u.id AND s.category != 'done') AS open_tasks
        FROM wt.users u ORDER BY u.active DESC, lower(u.name)`
     );
-    const current = await db.all(
-      `SELECT DISTINCT ON (a.user_id) a.user_id, a.app, a.last_at, t.jira_key, t.title
-       FROM wt.activity a JOIN wt.tasks t ON t.id = a.task_id
-       WHERE a.last_at >= ? ORDER BY a.user_id, a.last_at DESC`,
-      await activeWindowStart()
-    );
-    const byUser = new Map(current.map(({ user_id, ...rest }) => [user_id, rest]));
-    return users.map((u) => ({ ...u, working_on: byUser.get(u.id) ?? null }));
   }
 
   function validEmail(email) {
@@ -466,34 +426,32 @@ export function createTracker(db, { now = () => Date.now(), jiraBaseUrl = null }
   }
 
   /**
-   * A Claude Code session reported work on a ticket. The first report creates the ticket
-   * in the first active status (so its clock starts); later reports only record who is on
-   * it, where, and when. Two reports for a brand-new ticket can arrive at the same moment
-   * (separate serverless invocations), so creation is an INSERT ... ON CONFLICT.
+   * Someone started (or resumed) work on a ticket: a Claude Code session began on its branch,
+   * or Claude called start_ticket. The first time, the ticket is added in the first active status
+   * so its clock starts. Nothing else is recorded about the session: no app, no prompt activity,
+   * no last-seen time. Two first reports can arrive at the same moment (separate serverless
+   * invocations), so creation is an INSERT ... ON CONFLICT.
    */
-  async function recordActivity({ person, ticket, app, appRaw, repo, branch, sessionId, event, sessionSource }, source = 'hook') {
+  async function recordActivity({ person, ticket, event, sessionSource }, source = 'hook') {
     checkSource(source);
     const key = await normalizeKey(ticket, { strictCase: source === 'hook' });
     const user = await upsertPerson(person);
-    const sid = optionalText(sessionId, 'session id', 200) || `manual-${user.id}`;
-    const label = optionalText(app, 'app', 60) || 'Claude Code';
     // A ticket parked in a to-do status only restarts when a new session begins on it (or the
-    // person says they're on it via start_ticket) - not on every prompt of the session that parked it.
+    // person says they're on it via start_ticket), not when the session that parked it carries on.
     const resumes = source === 'claude' || (event === 'SessionStart' && sessionSource !== 'compact');
     const t = now();
-    const where = branch ? `Claude Code on branch ${branch}` : 'Claude Code';
 
     const result = await db.tx(async () => {
       const start = await startStatus();
       const inserted = await db.get(
-        `INSERT INTO wt.tasks (jira_key, assignee_id, status_id, created_at, updated_at, status_changed_at, closed_at, last_activity_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (jira_key) DO NOTHING RETURNING id`,
-        key, user.id, start.id, t, t, t, start.category === 'done' ? t : null, t
+        `INSERT INTO wt.tasks (jira_key, assignee_id, status_id, created_at, updated_at, status_changed_at, closed_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT (jira_key) DO NOTHING RETURNING id`,
+        key, user.id, start.id, t, t, t, start.category === 'done' ? t : null
       );
       let id;
       if (inserted) {
         id = inserted.id;
-        await insertEvent({ task_id: id, kind: 'created', to_status_id: start.id, to_user_id: user.id, actor_id: user.id, source, note: `Started in ${where}`, created_at: t });
+        await insertEvent({ task_id: id, kind: 'created', to_status_id: start.id, to_user_id: user.id, actor_id: user.id, source, note: 'Started in Claude Code', created_at: t });
         // Details captured when the ticket was loaded from Jira before work started.
         await db.run(
           `UPDATE wt.tasks t SET title = c.title, description = c.description, details_source = c.source, details_fetched_at = c.fetched_at
@@ -504,28 +462,17 @@ export function createTracker(db, { now = () => Date.now(), jiraBaseUrl = null }
         const task = await db.get('SELECT * FROM wt.tasks WHERE jira_key = ? FOR UPDATE', key);
         id = task.id;
         if (task.assignee_id !== user.id) {
-          await db.run('UPDATE wt.tasks SET assignee_id = ? WHERE id = ?', user.id, id);
-          await insertEvent({ task_id: id, kind: 'assigned', from_user_id: task.assignee_id, to_user_id: user.id, actor_id: user.id, source, note: `Now being worked on in ${where}`, created_at: t });
+          await db.run('UPDATE wt.tasks SET assignee_id = ?, updated_at = ? WHERE id = ?', user.id, t, id);
+          await insertEvent({ task_id: id, kind: 'assigned', from_user_id: task.assignee_id, to_user_id: user.id, actor_id: user.id, source, note: 'Picked up', created_at: t });
         }
         const current = await getStatus(task.status_id);
-        if (current.category === 'todo' && resumes) await moveStatus(id, start, `Work resumed in ${where}`, user, source);
-        await db.run('UPDATE wt.tasks SET last_activity_at = ? WHERE id = ?', t, id);
+        if (current.category === 'todo' && resumes) await moveStatus(id, start, 'Work resumed', user, source);
       }
-      await db.run(
-        `INSERT INTO wt.activity AS a (task_id, user_id, session_id, app, app_raw, repo, branch, first_at, last_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-         ON CONFLICT (session_id, task_id) DO UPDATE SET
-           last_at = EXCLUDED.last_at, pings = a.pings + 1, app = EXCLUDED.app, app_raw = EXCLUDED.app_raw,
-           repo = COALESCE(EXCLUDED.repo, a.repo), branch = COALESCE(EXCLUDED.branch, a.branch), user_id = EXCLUDED.user_id`,
-        id, user.id, sid, label, optionalText(appRaw, 'app', 300), optionalText(repo, 'repo', 200), optionalText(branch, 'branch', 200), t, t
-      );
-      await db.run('UPDATE wt.users SET last_seen_at = ?, last_app = ? WHERE id = ?', t, label, user.id);
       return { id, created: !!inserted };
     });
     return { created: result.created, person: await getUser(user.id), task: await getTask(result.id) };
   }
 
-  /** Title/description copied from Jira (or supplied by Claude when the server can't read Jira). */
   /**
    * Title/description from Jira ('jira': the server's own lookup or a captured Jira response)
    * or supplied by Claude ('claude'). Jira wins over Claude. A ticket that isn't tracked yet
@@ -593,7 +540,6 @@ export function createTracker(db, { now = () => Date.now(), jiraBaseUrl = null }
       const moved = await moveStatus(id, status, note, actor, source);
       if (sum) await saveSummary(id, sum, actor, source);
       if (!moved && clean(note)) await insertEvent({ task_id: id, kind: 'comment', actor_id: actor?.id, source, note: clean(note) });
-      await db.run('UPDATE wt.tasks SET last_activity_at = ? WHERE id = ?', now(), id);
       return moved;
     });
     return {
@@ -633,8 +579,7 @@ export function createTracker(db, { now = () => Date.now(), jiraBaseUrl = null }
     SELECT t.*, s.name AS status_name, s.color AS status_color, s.category AS status_category,
            s.stuck_after_days AS status_stuck_after_days,
            u.name AS assignee_name, u.email AS assignee_email,
-           (SELECT e.source FROM wt.task_events e WHERE e.task_id = t.id ORDER BY e.created_at DESC, e.id DESC LIMIT 1) AS last_source,
-           (SELECT a.app FROM wt.activity a WHERE a.task_id = t.id ORDER BY a.last_at DESC LIMIT 1) AS last_app
+           (SELECT e.source FROM wt.task_events e WHERE e.task_id = t.id ORDER BY e.created_at DESC, e.id DESC LIMIT 1) AS last_source
     FROM wt.tasks t
     JOIN wt.statuses s ON s.id = t.status_id
     LEFT JOIN wt.users u ON u.id = t.assignee_id`;
@@ -659,9 +604,6 @@ export function createTracker(db, { now = () => Date.now(), jiraBaseUrl = null }
       updated_at: row.updated_at,
       status_changed_at: row.status_changed_at,
       closed_at: row.closed_at,
-      last_activity_at: row.last_activity_at,
-      last_app: row.last_app,
-      working_now: row.last_activity_at != null && t - row.last_activity_at <= settings.active_minutes * 60_000,
       time_in_status_ms: inStatus,
       stuck_after_days: stuckDays,
       stuck: stuckDays > 0 && inStatus > stuckDays * DAY,
@@ -718,11 +660,6 @@ export function createTracker(db, { now = () => Date.now(), jiraBaseUrl = null }
     );
     task.events = events;
     task.time_by_status = timeByStatus(events);
-    task.sessions = await db.all(
-      `SELECT a.app, a.app_raw, a.repo, a.branch, a.first_at, a.last_at, a.pings, u.name AS person
-       FROM wt.activity a JOIN wt.users u ON u.id = a.user_id WHERE a.task_id = ? ORDER BY a.last_at DESC LIMIT 50`,
-      id
-    );
     return task;
   }
 
@@ -766,7 +703,7 @@ export function createTracker(db, { now = () => Date.now(), jiraBaseUrl = null }
     const users = (await listUsers()).filter((u) => u.active);
     const tasks = await listTasks({ includeDone: true, doneWithinDays: 7 });
     const people = [
-      ...users.map((u) => ({ id: u.id, name: u.name, email: u.email, role: u.role, last_seen_at: u.last_seen_at, last_app: u.last_app, working_on: u.working_on })),
+      ...users.map((u) => ({ id: u.id, name: u.name, email: u.email, role: u.role })),
       { id: null, name: 'Unassigned' },
     ];
     const t = now();
@@ -774,7 +711,7 @@ export function createTracker(db, { now = () => Date.now(), jiraBaseUrl = null }
       const mine = tasks.filter((x) => (x.assignee?.id ?? null) === p.id);
       const open = mine.filter((x) => x.status.category !== 'done');
       const counts = Object.fromEntries(statuses.map((s) => [s.id, mine.filter((x) => x.status.id === s.id).length]));
-      const lastUpdate = mine.reduce((m, x) => Math.max(m, x.updated_at, x.last_activity_at ?? 0), 0) || null;
+      const lastUpdate = mine.reduce((m, x) => Math.max(m, x.updated_at), 0) || null;
       return {
         ...p,
         counts,
@@ -827,7 +764,7 @@ export function createTracker(db, { now = () => Date.now(), jiraBaseUrl = null }
       })
       .filter((r) => !r.status.archived || r.current_count || r.finished_count);
 
-    // Start to done: first Claude activity -> entering a done status, for tickets closed in the window.
+    // Start to done: work started -> entering a done status, for tickets closed in the window.
     const closed = await db.all(
       `SELECT t.id, t.created_at, t.closed_at FROM wt.tasks t JOIN wt.statuses s ON s.id = t.status_id
        WHERE s.category = 'done' AND t.closed_at >= ? ${assigneeId ? 'AND t.assignee_id = ?' : ''}`,

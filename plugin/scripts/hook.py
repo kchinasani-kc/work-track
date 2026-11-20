@@ -4,9 +4,10 @@
   hook.py context    SessionStart, synchronous. On a ticket branch, prints one line that
                      tells Claude which ticket the session is on (stdout becomes context).
                      No network calls, so it never slows a session down.
-  hook.py ping       SessionStart + UserPromptSubmit, async. Reports "this person is
-                     working on this ticket in this app" to the tracker, plus the ticket
-                     title from .claude/jira-state/active.json when the pickup skill wrote one.
+  hook.py ping       SessionStart, async. Tells the tracker this person started work on this
+                     ticket (git name/email + ticket key, plus the title from
+                     .claude/jira-state/active.json when the pickup skill wrote one). Nothing
+                     about the session, app, repo or prompts is sent.
   hook.py jira       PostToolUse on getJiraIssue (any Atlassian connector), synchronous.
                      Takes the key, title and description from the Jira response, hands them
                      to a background process to send, and asks Claude for a starting summary.
@@ -132,12 +133,8 @@ def main():
                 "person": who,
                 "ticket": wt.key_from_branch(branch, keep_case=True),
                 "title": wt.active_ticket_title(cwd, key),
-                "branch": branch,
-                "repo": wt.repo_name(cwd),
-                "session_id": data.get("session_id"),
                 "event": data.get("hook_event_name"),
                 "session_source": data.get("source"),
-                "app_info": wt.app_info(),
             },
             timeout=15,  # runs in the background; allows for a cold start on a serverless host
         )

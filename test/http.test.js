@@ -91,8 +91,8 @@ test('postgres.js driver (as used with Supabase) over the Postgres wire protocol
 
   const person = { email: 'dev@example.com', name: 'Dev' };
   const first = await Promise.all([
-    tracker.recordActivity({ person, ticket: 'PROJ-1', app: 'Terminal', sessionId: 'x', event: 'SessionStart' }),
-    tracker.recordActivity({ person, ticket: 'PROJ-1', app: 'Terminal', sessionId: 'x', event: 'UserPromptSubmit' }),
+    tracker.recordActivity({ person, ticket: 'PROJ-1', event: 'SessionStart' }),
+    tracker.recordActivity({ person, ticket: 'PROJ-1', event: 'SessionStart' }),
   ]);
   assert.equal(first.filter((r) => r.created).length, 1);
   const actor = first[0].person;

@@ -26,9 +26,8 @@ const people = {
   Neha: { name: 'Neha Iyer', email: 'neha@example.com' },
   Vikram: { name: 'Vikram Rao', email: 'vikram@example.com' },
 };
-const apps = ['Claude desktop', 'VS Code', 'Cursor', 'Terminal'];
 
-// [key, title, description, person, app, [[status|null(start), msAgo, note, summary], ...], lastActivityAgo]
+// [key, title, description, person, (unused), [[status|null(start), msAgo, note, summary], ...]]
 const script = [
   ['PORT-412', 'Partner portal login redirect loop', 'Partners on Safari bounce between /login and /home after the 2.4 release.', 'Priya', 0,
     [[null, 13 * D], ['In Review', 9 * D, 'PR #88 open'], ['Done', 8 * D, 'Merged and deployed', 'Cleared the stale session cookie that Safari kept after logout, which caused the redirect loop. Added a regression test for the login flow.']], 8 * D],
@@ -50,21 +49,16 @@ const script = [
     [[null, 26 * H], ['To Do', 20 * H, 'Parked until OPS-255 is unblocked']], 20 * H],
 ];
 
-for (const [key, title, desc, who, appIdx, steps, lastAgo] of script) {
+for (const [key, title, desc, who, , steps] of script) {
   const person = people[who];
   const [first, ...rest] = steps;
   at(first[1]);
-  const { person: actor } = await tr.recordActivity({ person, ticket: key, app: apps[appIdx], branch: `feature/${key}`, repo: 'logistics-platform', sessionId: `${key}-1` });
+  const { person: actor } = await tr.recordActivity({ person, ticket: key, event: 'SessionStart' });
   await tr.setDetails(key, { title, description: desc }, 'jira');
   if (first[2]) await tr.addComment(key, first[2], actor, 'claude');
   for (const [status, msAgo, note, summary] of rest) {
     at(msAgo);
     await tr.changeStatus(key, status, { note, summary }, actor, 'claude');
-  }
-  if (lastAgo < first[1]) {
-    at(lastAgo);
-    const st = (await tr.getTask(key)).status.category;
-    if (st !== 'done' && st !== 'todo') await tr.recordActivity({ person, ticket: key, app: apps[appIdx], branch: `feature/${key}`, repo: 'logistics-platform', sessionId: `${key}-2` });
   }
 }
 clock = Date.now();

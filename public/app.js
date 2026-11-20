@@ -48,18 +48,25 @@ function append(el, children) {
 const $ = (sel, root = document) => root.querySelector(sel);
 
 // ---------- formatting ----------
+// Time is shown in days: this is a status board, not a stopwatch.
 function fmt(ms) {
   if (ms == null || Number.isNaN(ms)) return '–';
-  const m = Math.floor(ms / 60000);
-  if (m < 1) return '<1m';
-  if (m < 60) return `${m}m`;
-  const hrs = Math.floor(m / 60);
-  if (hrs < 24) return `${hrs}h ${m % 60}m`;
-  const d = Math.floor(hrs / 24);
-  return `${d}d ${hrs % 24}h`;
+  const d = Math.floor(ms / DAY);
+  if (d < 1) return '< 1 day';
+  return d === 1 ? '1 day' : `${d} days`;
 }
-const ago = (ts) => (ts ? `${fmt(Date.now() - ts)} ago` : 'never');
-const dateTime = (ts) => new Date(ts).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
+// Averages and medians keep one decimal so short waits still compare.
+function fmtAvg(ms) {
+  if (ms == null || Number.isNaN(ms)) return '–';
+  const d = ms / DAY;
+  if (d < 0.1) return '< 0.1 days';
+  return `${d < 10 ? d.toFixed(1) : Math.round(d)} days`;
+}
+const dateTime = (ts) => new Date(ts).toLocaleDateString(undefined, { day: 'numeric', month: 'short' });
+const refreshedAgo = (ts) => {
+  const m = Math.floor((Date.now() - ts) / 60000);
+  return m < 1 ? 'just now' : m < 60 ? `${m} min ago` : 'over an hour ago';
+};
 const daysLabel = (d) => (d === 1 ? '1 day' : `${+d.toFixed(1)} days`);
 const titleOf = (t) => t.title || 'Title not loaded from Jira yet';
 
@@ -352,8 +359,8 @@ async function renderWaiting() {
     h('div', null, h('b', null, openNow), h('span', null, 'open now')),
     h('div', null, h('b', { style: { color: r.stuck.length ? 'var(--hot)' : '' } }, r.stuck.length), h('span', null, 'stuck now')),
     h('div', null, h('b', null, r.closed_count), h('span', null, `done in ${windowText}`)),
-    h('div', null, h('b', null, fmt(r.cycle_avg_ms)), h('span', null, 'average start to done')),
-    h('div', null, h('b', null, fmt(r.cycle_median_ms)), h('span', null, 'median start to done')));
+    h('div', null, h('b', null, fmtAvg(r.cycle_avg_ms)), h('span', null, 'average start to done')),
+    h('div', null, h('b', null, fmtAvg(r.cycle_median_ms)), h('span', null, 'median start to done')));
 
   const table = h('table', { class: 'data' },
     h('thead', null, h('tr', null,
@@ -368,13 +375,13 @@ async function renderWaiting() {
     h('tbody', null, r.statuses.map((s) => h('tr', { class: 'clickable', onclick: () => { state.filters.assignee = f.agingAssignee; location.hash = '#/board'; } },
       h('td', null, statusPill(s.status), s.status.archived ? h('span', { class: 'muted' }, ' (archived)') : null),
       h('td', { class: 'num mono' }, s.current_count),
-      h('td', { class: 'num mono hide-sm' }, fmt(s.current_avg_ms)),
+      h('td', { class: 'num mono hide-sm' }, fmtAvg(s.current_avg_ms)),
       h('td', { class: 'num' }, s.current_max_ms != null ? h('span', { class: `wait ${s.stuck_after_days && s.current_max_ms > s.stuck_after_days * DAY ? 'hot' : ''}` }, fmt(s.current_max_ms)) : h('span', { class: 'muted' }, '–')),
       h('td', null, s.finished_count
         ? h('div', { class: 'hbar', style: { '--status-color': s.status.color }, title: `${s.finished_count} time(s) a ticket left ${s.status.name}` },
-            h('i', { style: { width: `${Math.max(3, (s.finished_avg_ms / maxAvg) * 120)}px` } }), h('span', { class: 'wait' }, fmt(s.finished_avg_ms)), h('span', { class: 'muted' }, `× ${s.finished_count}`))
+            h('i', { style: { width: `${Math.max(3, (s.finished_avg_ms / maxAvg) * 120)}px` } }), h('span', { class: 'wait' }, fmtAvg(s.finished_avg_ms)), h('span', { class: 'muted' }, `× ${s.finished_count}`))
         : h('span', { class: 'muted' }, 'no tickets have left this status yet')),
-      h('td', { class: 'num mono hide-sm' }, fmt(s.finished_median_ms)),
+      h('td', { class: 'num mono hide-sm' }, fmtAvg(s.finished_median_ms)),
       h('td', { class: 'num hide-sm muted' }, s.stuck_after_days ? daysLabel(s.stuck_after_days) : 'never'),
       h('td', { class: 'num' }, s.stuck_count ? h('span', { class: 'stuck-flag' }, s.stuck_count) : h('span', { class: 'muted' }, '0'))))));
 
@@ -390,7 +397,7 @@ async function renderWaiting() {
   return h('div', null, head,
     h('div', { class: 'panel', style: { marginBottom: '16px' } }, summary, h('div', { style: { overflowX: 'auto' } }, table),
       h('div', { class: 'panel-body muted', style: { borderTop: '1px solid var(--line)', fontSize: '13px' } },
-        `“Waiting now” is open tickets sitting in the status today. “Average time spent” and “Median” cover every time a ticket moved out of the status in ${windowText}. “Start to done” runs from the first time someone worked on the ticket in Claude Code.`)),
+        `“Waiting now” is open tickets sitting in the status today. “Average time spent” and “Median” cover every time a ticket moved out of the status in ${windowText}. “Start to done” runs from when work on the ticket started.`)),
     stuck);
 }
 
@@ -419,7 +426,7 @@ async function renderPeople() {
       h('button', { class: 'btn sm ghost', onclick: () => editPerson(u) }, 'Edit'),
       u.role === 'manager' ? h('button', { class: 'btn sm ghost', onclick: () => setPassword(u) }, u.has_password ? 'Change password' : 'Set password') : null,
       h('button', { class: `btn sm ghost ${u.active ? 'danger' : ''}`, onclick: async () => {
-        if (u.active && !confirm(`Deactivate ${u.name}? Activity from ${u.email} is ignored until they're reactivated. Their tickets stay as they are.`)) return;
+        if (u.active && !confirm(`Deactivate ${u.name}? Status updates from ${u.email} are ignored until they're reactivated. Their tickets stay as they are.`)) return;
         try { await api(`/users/${u.id}`, { method: 'PATCH', body: { active: !u.active } }); await loadMeta(); refreshView(); toast(u.active ? `${u.name} deactivated` : `${u.name} reactivated`); } catch (err) { fail(err); }
       } }, u.active ? 'Deactivate' : 'Reactivate')))));
 
@@ -664,13 +671,13 @@ async function openTask(key) {
     h('span', { class: 'muted', style: { width: '100%', fontSize: '12px' } },
       `Since ${dateTime(t.status_changed_at)}`,
       t.stuck_after_days ? ` · limit ${daysLabel(t.stuck_after_days)} (${Math.round(frac * 100)}%)` : '',
-      ` · first worked on ${ago(t.created_at)}`),
+      ` · started ${dateTime(t.created_at)}`),
     h('span', { style: { width: '100%', display: 'flex', alignItems: 'center', gap: '8px' } },
       avatar(t.assignee), h('span', null, t.assignee?.name ?? 'Unassigned')));
 
   const summary = h('div', null, h('p', { class: 'section-label' }, 'Work summary'),
     t.work_summary
-      ? h('div', { class: 'summary-box' }, t.work_summary, h('div', { class: 'muted', style: { fontSize: '12px', marginTop: '6px' } }, `Written by Claude ${ago(t.summary_updated_at)}`))
+      ? h('div', { class: 'summary-box' }, t.work_summary, h('div', { class: 'muted', style: { fontSize: '12px', marginTop: '6px' } }, `Written by Claude, ${dateTime(t.summary_updated_at)}`))
       : h('div', { class: 'muted' }, 'No summary yet. Claude writes one when the ticket is picked up from Jira, and replaces it with what was done at the end.'));
 
   const description = h('div', null, h('p', { class: 'section-label' }, `Description${t.details_source === 'jira' ? ' (from Jira)' : t.details_source === 'claude' ? ' (via Claude)' : ''}`),
@@ -768,7 +775,7 @@ window.addEventListener('hashchange', () => { if (state.me) { closeDrawer(); rou
 // Keep the page current while it's open, without disturbing anyone mid-edit.
 setInterval(() => {
   const label = $('#updated');
-  if (label && state.lastLoaded) label.textContent = `Updated ${Date.now() - state.lastLoaded < 60000 ? 'just now' : ago(state.lastLoaded)}`;
+  if (label && state.lastLoaded) label.textContent = `Updated ${refreshedAgo(state.lastLoaded)}`;
   if (!state.me || document.visibilityState !== 'visible' || !$('#view')) return;
   if ($('.modal-wrap') || $('#drawer')) return;
   const active = document.activeElement;

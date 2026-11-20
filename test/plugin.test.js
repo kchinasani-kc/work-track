@@ -92,8 +92,8 @@ after(() => {
   for (const d of [repo, otherRepo]) fs.rmSync(d, { recursive: true, force: true });
 });
 
-test('hook: ping records the ticket, person and app, and fills the title from Jira', async () => {
-  const r = await runHook('ping', { cwd: repo, session_id: 'sess-1', hook_event_name: 'UserPromptSubmit', prompt: 'fix it' }, {
+test('hook: session start registers the ticket and person, and fills the title from Jira', async () => {
+  const r = await runHook('ping', { cwd: repo, session_id: 'sess-1', hook_event_name: 'SessionStart', source: 'startup' }, {
     CLAUDE_CODE_ENTRYPOINT: 'claude-vscode', __CFBundleIdentifier: 'com.todesktop.230313mzl4w4u92',
   });
   assert.equal(r.status, 0, r.stderr);
@@ -105,8 +105,6 @@ test('hook: ping records the ticket, person and app, and fills the title from Ji
   assert.equal(t.assignee.email, 'priya@example.com');
   assert.equal(t.assignee.name, 'Priya Sharma');
   assert.equal(t.status.name, 'In Progress');
-  assert.equal(t.sessions[0].app, 'Cursor');
-  assert.equal(t.sessions[0].branch, 'feature/PROJ-7');
   assert.ok(jiraRequests.every((q) => q.method === 'GET'), 'tracker must only read from Jira');
   assert.equal(jiraRequests[0].auth, `Basic ${Buffer.from('bot@example.com:jira-test-token').toString('base64')}`);
 });
@@ -287,4 +285,25 @@ test('jira hook: Claude is nudged once per ticket per session, details are saved
   assert.match((await run('CAP-7', 's-b')).stdout, /CAP-7/, 'new session: nudged again');
   assert.ok(await waitFor(() => db.get("SELECT 1 AS x FROM wt.jira_details WHERE jira_key = 'CAP-7'")));
   fs.rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('privacy: the plugin sends only who and which ticket, and never hooks every prompt', async () => {
+  const hooks = JSON.parse(fs.readFileSync(path.join(root, 'plugin/hooks/hooks.json'), 'utf8')).hooks;
+  assert.deepEqual(Object.keys(hooks).sort(), ['PostToolUse', 'SessionStart']);
+  // Capture exactly what the session-start hook sends.
+  const bodies = [];
+  const spy = http.createServer((req, res) => {
+    let b = '';
+    req.on('data', (d) => (b += d));
+    req.on('end', () => { bodies.push(JSON.parse(b)); res.writeHead(200, { 'Content-Type': 'application/json' }); res.end('{}'); });
+  });
+  const spyUrl = await listen(spy);
+  await runHook('ping', { cwd: repo, session_id: 'secret-session', transcript_path: '/x', hook_event_name: 'SessionStart', source: 'startup', prompt: 'private prompt' }, {
+    CLAUDE_PLUGIN_OPTION_SERVER_URL: spyUrl, CLAUDE_CODE_ENTRYPOINT: 'cli', TERM_PROGRAM: 'iTerm.app',
+  });
+  spy.close();
+  assert.equal(bodies.length, 1);
+  assert.deepEqual(Object.keys(bodies[0]).sort(), ['event', 'person', 'session_source', 'ticket', 'title']);
+  assert.deepEqual(Object.keys(bodies[0].person).sort(), ['email', 'name']);
+  assert.doesNotMatch(JSON.stringify(bodies[0]), /secret-session|private prompt|iTerm|cli/);
 });

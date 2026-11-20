@@ -130,17 +130,13 @@ TOOLS = [
 # ---------- formatting ----------
 
 def dur(ms):
+    """Time in days: this is a status tracker, not a stopwatch."""
     if ms is None:
         return ""
-    m = int(ms // 60000)
-    if m < 1:
-        return "under a minute"
-    if m < 60:
-        return f"{m}m"
-    h = m // 60
-    if h < 24:
-        return f"{h}h {m % 60}m"
-    return f"{h // 24}d {h % 24}h"
+    d = int(ms // 86_400_000)
+    if d < 1:
+        return "less than a day"
+    return "1 day" if d == 1 else f"{d} days"
 
 
 def line(t):
@@ -192,11 +188,6 @@ def person(args):
     return who
 
 
-def where(args):
-    cwd = checkout(args)
-    return {"repo": wt.repo_name(cwd), "branch": wt.current_branch(cwd), "app_info": wt.app_info(), "session_id": f"mcp-{os.getpid()}"}
-
-
 def call_tool(name, args):
     if name == "current_ticket":
         cwd = checkout(args)
@@ -211,7 +202,7 @@ def call_tool(name, args):
                 return f"Branch {branch} is ticket {key}, but it isn't in the tracker yet. Call start_ticket with {key}."
             raise
     if name == "start_ticket":
-        r = wt.post("/start", {"person": person(args), "ticket": args["ticket"], "title": args.get("title"), "description": args.get("description"), "summary": args.get("summary"), **where(args)})
+        r = wt.post("/start", {"person": person(args), "ticket": args["ticket"], "title": args.get("title"), "description": args.get("description"), "summary": args.get("summary")})
         t = r["task"]
         lead = "Added" if r.get("created") else "Recorded work on"
         msg = f"{lead} {t['key']} \"{t.get('title') or '(title not loaded)'}\" - status {t['status']}."
@@ -302,8 +293,7 @@ def handle(msg):
 def main():
     url, key = wt.config()
     wt.log(
-        f"mcp server started: tracker={url or 'NOT SET'} team_key={'set' if key else 'NOT SET'} "
-        f"project_dir={os.environ.get('CLAUDE_PROJECT_DIR')} cwd={os.getcwd()} app={wt.app_info()}"
+        f"mcp server started: tracker={url or 'NOT SET'} team_key={'set' if key else 'NOT SET'}"
     )
     for raw in sys.stdin:
         raw = raw.strip()

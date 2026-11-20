@@ -1,5 +1,5 @@
 import express from 'express';
-import { AppError, appLabel } from './service.js';
+import { AppError } from './service.js';
 import { refreshFromJira } from './jira.js';
 
 const JIRA_WAIT_MS = 4000;
@@ -51,22 +51,12 @@ export function claudeRouter(tracker, { jira = null } = {}) {
     await Promise.race([refreshFromJira(tracker, jira, key), new Promise((ok) => setTimeout(ok, JIRA_WAIT_MS))]);
   }
 
+  // Only who and which ticket; nothing about the session, app or machine is accepted or stored.
   function activityInput(b) {
-    const info = b.app_info ?? {};
-    return {
-      person: b.person ?? {},
-      ticket: b.ticket,
-      app: appLabel(info),
-      appRaw: [info.entrypoint, info.bundle, info.term_program].filter(Boolean).join(' | ') || null,
-      repo: b.repo,
-      branch: b.branch,
-      sessionId: b.session_id,
-      event: b.event,
-      sessionSource: b.session_source,
-    };
+    return { person: b.person ?? {}, ticket: b.ticket, event: b.event, sessionSource: b.session_source };
   }
 
-  // Hook: a session is working on a ticket (key taken from the branch name).
+  // Hook: a Claude Code session started on a ticket's branch (key taken from the branch name).
   r.post('/activity', wrap(async (b) => {
     const out = await tracker.recordActivity(activityInput(b), 'hook');
     // Title the pickup skill saved in .claude/jira-state/active.json (never overrides Jira data).

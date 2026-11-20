@@ -22,8 +22,7 @@ The manager sees five pages:
  git branch feature/PROJ-123
         │
  Claude Code + work-tracker plugin
-   hook (session start, each prompt) ── who / ticket / app ──▶  records activity
-                                                                  first time: adds PROJ-123
+   hook (session start, once) ───── who / ticket ──────────▶  first time: adds PROJ-123
                                                                   in the first Active status
                                                                          │
                                                                          ▼
@@ -33,7 +32,7 @@ The manager sees five pages:
           set_work_summary, ...
 ```
 
-- **Hooks.** The plugin's hooks run on session start and on every prompt, in the background. They never slow Claude down, and they do nothing outside a ticket branch. At session start they also tell Claude which ticket the session is on.
+- **Hooks.** When a Claude Code session starts on a ticket branch, the plugin tells the tracker once, in the background: the person's git name and email and the ticket key. It also tells Claude which ticket the session is on. Outside a ticket branch it does nothing.
 - **Ticket details from your Jira skill.** Whenever Claude loads a ticket with an Atlassian connector's `getJiraIssue` tool, as the `jira-pickup` skill does, a plugin hook reads the key, title and description from the response and sends them to the tracker.
   - This happens even before the ticket's branch exists; the details are kept and shown as soon as work on it starts.
   - The title the skill writes to `.claude/jira-state/active.json` is used as a backup.
@@ -181,6 +180,17 @@ The plugin tells Claude to keep things current on its own. People can also be di
 | `get_ticket` | Title, description, status, summary, history and time in each status |
 | `list_statuses` | The current statuses, in order |
 | `set_ticket_details` | Title and description from Jira, when the server can't read Jira itself |
+
+## What is and isn't tracked
+
+This is a status board, not a monitoring tool. The tracker stores:
+
+- the tickets someone has started, with their Jira key, title and description
+- who is working on each ticket (git name and email)
+- each status change, with Claude's one-line note
+- the work summary: a starting one at pickup, replaced with what was done at the end
+
+It doesn't store prompts, sessions, which app someone uses, how often they use Claude, or when they were last active. Times are shown in days, and history shows dates, not times of day. Upgrading from an earlier version deletes any of that data the tracker had collected.
 
 ## Statuses
 

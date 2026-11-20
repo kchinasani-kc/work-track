@@ -1,14 +1,14 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { connect, migrate } from '../src/db.js';
-import { createTracker, appLabel } from '../src/service.js';
+import { createTracker, formatDuration } from '../src/service.js';
 
 const H = 3_600_000;
 const D = 24 * H;
 const ravi = { email: 'Ravi@Example.com', name: 'Ravi Kumar' };
 const asha = { email: 'asha@example.com', name: 'Asha' };
 const at = (tracker, who, ticket, extra = {}) =>
-  tracker.recordActivity({ person: who, ticket, app: 'Claude desktop', branch: `feature/${ticket}`, sessionId: 's1', ...extra });
+  tracker.recordActivity({ person: who, ticket, event: 'SessionStart', ...extra });
 
 async function setup(t) {
   let clock = Date.UTC(2026, 0, 5, 9);
@@ -28,27 +28,27 @@ test('first activity creates the ticket in the first active status, with the per
   assert.equal(r.task.assignee.email, 'ravi@example.com');
   assert.equal(r.task.jira_url, 'https://acme.atlassian.net/browse/PROJ-12');
   assert.equal(r.task.title, null);
-  assert.equal(r.task.working_now, true);
   assert.equal(typeof r.task.created_at, 'number');
   // Same person again (different case in git config): no duplicate person, no new ticket.
-  const again = await at(tracker, { email: 'ravi@example.com', name: 'Ravi K' }, 'PROJ-12', { sessionId: 's2' });
+  const again = await at(tracker, { email: 'ravi@example.com', name: 'Ravi K' }, 'PROJ-12');
   assert.equal(again.created, false);
   assert.equal((await tracker.listUsers()).length, 1);
-  assert.equal((await tracker.getTask('proj-12')).sessions.length, 2);
+  // Status tracking only: nothing about sessions, apps or activity is exposed.
+  const task12 = await tracker.getTask('proj-12');
+  for (const k of ['sessions', 'working_now', 'last_activity_at', 'last_app']) assert.equal(k in task12, false, k);
+  assert.deepEqual(task12.events.map((e) => e.note), ['Started in Claude Code']);
 });
 
 test('two first reports at the same moment create one ticket and one person', async (t) => {
   const { tracker } = await setup(t);
   const results = await Promise.all([
-    at(tracker, ravi, 'PROJ-50', { sessionId: 'a', event: 'SessionStart' }),
-    at(tracker, ravi, 'PROJ-50', { sessionId: 'a', event: 'UserPromptSubmit' }),
+    at(tracker, ravi, 'PROJ-50'),
+    at(tracker, ravi, 'PROJ-50'),
   ]);
   assert.equal(results.filter((r) => r.created).length, 1);
   assert.equal((await tracker.listUsers()).length, 1);
   const task = await tracker.getTask('PROJ-50');
   assert.equal(task.events.filter((e) => e.kind === 'created').length, 1);
-  assert.equal(task.sessions.length, 1);
-  assert.equal(task.sessions[0].pings, 2);
 });
 
 test('time in each status comes from the event log; done needs a summary from Claude', async (t) => {
@@ -90,7 +90,7 @@ test('parked tickets stay parked for the rest of the session and restart on a ne
   await tracker.changeStatus('PROJ-5', 'To Do', { note: 'parked' }, person, 'claude');
   assert.equal((await at(tracker, ravi, 'PROJ-5', { event: 'UserPromptSubmit' })).task.status.name, 'To Do');
   assert.equal((await at(tracker, ravi, 'PROJ-5', { event: 'SessionStart', sessionSource: 'compact' })).task.status.name, 'To Do');
-  const r = await at(tracker, asha, 'PROJ-5', { sessionId: 's9', event: 'SessionStart', sessionSource: 'startup' });
+  const r = await at(tracker, asha, 'PROJ-5', { event: 'SessionStart', sessionSource: 'startup' });
   assert.equal(r.task.assignee.name, 'Asha');
   assert.equal(r.task.status.name, 'In Progress');
   const kinds = (await tracker.getTask('PROJ-5')).events.map((e) => e.kind);
@@ -137,7 +137,6 @@ test('stuck flag follows per-status limits', async (t) => {
   assert.deepEqual((await tracker.listTasks()).filter((x) => x.stuck).map((x) => x.key), ['PROJ-2']);
   advance(2 * D);
   assert.deepEqual((await tracker.listTasks()).filter((x) => x.stuck).map((x) => x.key).sort(), ['PROJ-1', 'PROJ-2']);
-  assert.equal((await tracker.getTask('PROJ-1')).working_now, false);
 });
 
 test('custom statuses: case-insensitive names, rename keeps history, archive moves tickets', async (t) => {
@@ -160,7 +159,7 @@ test('custom statuses: case-insensitive names, rename keeps history, archive mov
 test('reports: averages, start-to-done, team lanes with "working on"', async (t) => {
   const { tracker, advance } = await setup(t);
   const { person: r } = await at(tracker, ravi, 'PROJ-1');
-  const { person: a } = await at(tracker, asha, 'PROJ-2', { sessionId: 's2' });
+  const { person: a } = await at(tracker, asha, 'PROJ-2');
   advance(2 * D);
   await tracker.changeStatus('PROJ-1', 'Done', { summary: 'Shipped.' }, r, 'claude');
   advance(D);
@@ -170,11 +169,10 @@ test('reports: averages, start-to-done, team lanes with "working on"', async (t)
   assert.equal(ip.finished_avg_ms, 2 * D);
   assert.equal(ip.current_max_ms, 3 * D);
   assert.equal(aging.cycle_avg_ms, 2 * D);
-  await at(tracker, asha, 'PROJ-2', { sessionId: 's3', app: 'Cursor' });
   const team = await tracker.teamSummary();
   const asRow = team.people.find((p) => p.id === a.id);
-  assert.equal(asRow.working_on.jira_key, 'PROJ-2');
-  assert.equal(asRow.working_on.app, 'Cursor');
+  assert.deepEqual(asRow.tasks.map((x) => x.key), ['PROJ-2']);
+  assert.equal('working_on' in asRow || 'last_seen_at' in asRow, false);
   assert.equal(team.people.find((p) => p.id === r.id).done_last_7d, 1);
 });
 
@@ -198,12 +196,30 @@ test('auth: team key, manager sessions, deactivated people are ignored', async (
   await assert.rejects(at(tracker, ravi, 'PROJ-1'), /deactivated/);
 });
 
-test('app labels from raw hook hints', () => {
-  assert.equal(appLabel({ entrypoint: 'claude-desktop', bundle: 'com.anthropic.claudefordesktop' }), 'Claude desktop');
-  assert.equal(appLabel({ entrypoint: 'claude-vscode', bundle: 'com.todesktop.230313mzl4w4u92' }), 'Cursor');
-  assert.equal(appLabel({ entrypoint: 'claude-vscode', bundle: 'com.microsoft.VSCode' }), 'VS Code');
-  assert.equal(appLabel({ entrypoint: 'cli', term_program: 'Apple_Terminal' }), 'Terminal');
-  assert.equal(appLabel({}), 'Claude Code');
+test('durations are reported in days', () => {
+  assert.equal(formatDuration(5 * H), 'less than a day');
+  assert.equal(formatDuration(D + 5 * H), '1 day');
+  assert.equal(formatDuration(3 * D + 23 * H), '3 days');
+});
+
+test('upgrading removes activity data stored by earlier versions', async (t) => {
+  const { tracker, db } = await setup(t);
+  await at(tracker, ravi, 'PROJ-1');
+  // What an older version left behind.
+  await db.run('CREATE TABLE wt.activity (id integer, app text, session_id text)');
+  await db.run("INSERT INTO wt.activity VALUES (1, 'Cursor', 'abc')");
+  await db.run('ALTER TABLE wt.users ADD COLUMN last_seen_at bigint');
+  await db.run('ALTER TABLE wt.users ADD COLUMN last_app text');
+  await db.run('ALTER TABLE wt.tasks ADD COLUMN last_activity_at bigint');
+  await db.run("INSERT INTO wt.settings (key, value) VALUES ('active_minutes', '30')");
+  await db.run("UPDATE wt.task_events SET note = 'Started in Cursor, branch feature/PROJ-1'");
+  await db.run("UPDATE wt.settings SET value = '4' WHERE key = 'schema_version'");
+  await migrate(db);
+  assert.equal((await db.get("SELECT to_regclass('wt.activity') IS NULL AS gone")).gone, true);
+  const cols = (await db.all("SELECT column_name FROM information_schema.columns WHERE table_schema = 'wt' AND column_name IN ('last_seen_at', 'last_app', 'last_activity_at')"));
+  assert.deepEqual(cols, []);
+  assert.equal(await db.get("SELECT 1 AS x FROM wt.settings WHERE key = 'active_minutes'"), undefined);
+  assert.equal((await tracker.getTask('PROJ-1')).events[0].note, 'Started in Claude Code');
 });
 
 test('details for a ticket loaded before anyone works on it are kept and applied when work starts', async (t) => {

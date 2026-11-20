@@ -1,7 +1,7 @@
 {
   "name": "work-tracker",
-  "version": "1.1.0",
-  "description": "Reports the Jira ticket you're working on in Claude Code to the team's Work Tracker, and lets Claude update its status and work summary. Jira itself is never changed.",
+  "version": "1.2.0",
+  "description": "Keeps your team's Work Tracker up to date with the status of the Jira ticket you're working on in Claude Code. Sends only who you are (git name/email), the ticket key, its Jira title/description, and the status changes and summaries Claude records. Jira itself is never changed.",
   "author": {
     "name": "Work Tracker"
   },
