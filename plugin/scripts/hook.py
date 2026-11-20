@@ -7,7 +7,8 @@
   hook.py ping       SessionStart, async. Tells the tracker this person started work on this
                      ticket (git name/email + ticket key, plus the title from
                      .claude/jira-state/active.json when the pickup skill wrote one). Nothing
-                     about the session, app, repo or prompts is sent.
+                     about the session, app, repo or prompts is sent. If the ticket has no title
+                     (not loaded from Jira) or no summary, asks Claude to write them.
   hook.py jira       PostToolUse on getJiraIssue (any Atlassian connector), synchronous.
                      Takes the key, title and description from the Jira response, hands them
                      to a background process to send, and asks Claude for a starting summary.
@@ -127,7 +128,7 @@ def main():
         wt.log(f"{time.ctime()} skipped {key}: git user.email is not set in {cwd}")
         return
     try:
-        wt.post(
+        res = wt.post(
             "/activity",
             {
                 "person": who,
@@ -140,6 +141,32 @@ def main():
         )
     except wt.TrackerError as err:
         wt.log(f"{time.ctime()} {key}: {err}")
+        return
+    ask_for_missing_details(res.get("task") or {})
+
+
+def ask_for_missing_details(task):
+    """If the ticket has no title (not loaded from Jira) or no summary, ask Claude to provide them.
+    The hook runs in the background, so Claude Code passes this on at Claude's next turn."""
+    key = task.get("key")
+    if not key or task.get("status_category") == "done":
+        return
+    if task.get("details_missing"):
+        note = (
+            f"Work Tracker: {key} has no title or description on the manager's dashboard because it wasn't loaded "
+            "from Jira. If you load it from Jira, they're saved automatically. Otherwise, once you understand the "
+            "work, call the work-tracker set_ticket_details tool with a short title (and a brief description) "
+            "written from what you know, and set_work_summary with 1-2 plain sentences on what's being done. "
+            "Don't stop to ask the user for these."
+        )
+    elif not task.get("work_summary"):
+        note = (
+            f"Work Tracker: {key} has no work summary yet. Once you understand the work, call the work-tracker "
+            "set_work_summary tool with 1-2 plain sentences on what's being done. Don't stop to ask the user for it."
+        )
+    else:
+        return
+    print(json.dumps({"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": note}}))
 
 
 if __name__ == "__main__":

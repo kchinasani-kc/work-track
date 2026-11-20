@@ -97,7 +97,10 @@ test('hook: session start registers the ticket and person, and fills the title f
     CLAUDE_CODE_ENTRYPOINT: 'claude-vscode', __CFBundleIdentifier: 'com.todesktop.230313mzl4w4u92',
   });
   assert.equal(r.status, 0, r.stderr);
-  assert.equal(r.stdout, '', 'ping must print nothing (stdout becomes Claude context)');
+  // Title came from Jira, but there's no summary yet: Claude is asked for one (at its next turn).
+  const asked = JSON.parse(r.stdout).hookSpecificOutput;
+  assert.equal(asked.hookEventName, 'SessionStart');
+  assert.match(asked.additionalContext, /PROJ-7 has no work summary yet.*set_work_summary/);
   let t;
   for (let i = 0; i < 40 && !(t = await tracker.getTask('PROJ-7')).title; i++) await sleep(50);
   assert.equal(t.title, 'Login redirect loop');
@@ -306,4 +309,52 @@ test('privacy: the plugin sends only who and which ticket, and never hooks every
   assert.deepEqual(Object.keys(bodies[0]).sort(), ['event', 'person', 'session_source', 'ticket', 'title']);
   assert.deepEqual(Object.keys(bodies[0].person).sort(), ['email', 'name']);
   assert.doesNotMatch(JSON.stringify(bodies[0]), /secret-session|private prompt|iTerm|cli/);
+});
+
+test('branch names: the Jira key is found after any prefix', async () => {
+  const code = `import json, sys; sys.path.insert(0, ${JSON.stringify(path.join(root, 'plugin/scripts'))}); import wt_common as wt
+branches = ["feature/UN-1157", "bug/UN-1157", "merge/UN-1157", "hotfix/UN-1157-login-fix", "UN-1157", "release/2026.11/UN-1157", "feature/un-1157", "main", "release/v-2", "claude/eager-turing", "dependabot/npm_and_yarn/lodash-4.17.21"]
+print(json.dumps([wt.key_from_branch(b) for b in branches] + [wt.key_from_branch("dependabot/npm_and_yarn/lodash-4.17.21", keep_case=True)]))`;
+  const r = await runPy(['-c', code], '', { PATH: process.env.PATH });
+  assert.deepEqual(JSON.parse(r.stdout), [
+    'UN-1157', 'UN-1157', 'UN-1157', 'UN-1157', 'UN-1157', 'UN-1157', 'UN-1157', null, null, null, 'LODASH-4',
+    'lodash-4', // sent as written; the server ignores lowercase keys unless the project is listed
+  ]);
+});
+
+test('no Jira data: Claude is asked for a title and summary, and tools default to the branch ticket', async () => {
+  const noj = gitRepo('bug/NOJ-1'); // the fake Jira doesn't know NOJ-1
+  let r = await runHook('ping', { cwd: noj, session_id: 'noj', hook_event_name: 'SessionStart', source: 'startup' });
+  assert.match(JSON.parse(r.stdout).hookSpecificOutput.additionalContext, /NOJ-1 has no title or description.*wasn't loaded from Jira.*set_ticket_details.*set_work_summary/);
+
+  const client = new Client({ name: 'test', version: '1.0.0' });
+  await client.connect(new StdioClientTransport({
+    command: PY, args: [MCP],
+    env: { PATH: process.env.PATH, HOME: process.env.HOME, WORK_TRACKER_URL: base, WORK_TRACKER_KEY: teamKey, CLAUDE_PROJECT_DIR: noj },
+    stderr: 'pipe',
+  }));
+  const text = (x) => x.content.map((c) => c.text).join('\n');
+  assert.match(text(await client.callTool({ name: 'current_ticket', arguments: {} })), /No title yet: it wasn't loaded from Jira.*\n.*No work summary yet/s);
+  // No ticket argument: everything defaults to NOJ-1 from the branch.
+  assert.match(text(await client.callTool({ name: 'set_ticket_details', arguments: { title: 'Fix CSV export encoding', description: 'Non-ASCII names break the export.' } })), /Saved title and description for NOJ-1/);
+  assert.match(text(await client.callTool({ name: 'set_work_summary', arguments: { summary: 'Switching the CSV writer to UTF-8 with BOM so Excel opens it correctly.' } })), /NOJ-1/);
+  assert.match(text(await client.callTool({ name: 'update_ticket_status', arguments: { status: 'In Review', note: 'PR open' } })), /NOJ-1 moved In Progress -> In Review/);
+  await client.close();
+  const t = await tracker.getTask('NOJ-1');
+  assert.equal(t.title, 'Fix CSV export encoding');
+  assert.equal(t.details_source, 'claude');
+  assert.match(t.work_summary, /UTF-8/);
+
+  // Nothing missing any more: the next session start asks for nothing.
+  r = await runHook('ping', { cwd: noj, session_id: 'noj-2', hook_event_name: 'SessionStart', source: 'startup' });
+  assert.equal(r.stdout, '');
+  fs.rmSync(noj, { recursive: true, force: true });
+
+  // Off a ticket branch, a tool without a ticket explains what to pass.
+  const c2 = new Client({ name: 'test', version: '1.0.0' });
+  await c2.connect(new StdioClientTransport({ command: PY, args: [MCP], env: { PATH: process.env.PATH, HOME: process.env.HOME, WORK_TRACKER_URL: base, WORK_TRACKER_KEY: teamKey, CLAUDE_PROJECT_DIR: otherRepo }, stderr: 'pipe' }));
+  const bad = await c2.callTool({ name: 'update_ticket_status', arguments: { status: 'Done', summary: 'x' } });
+  assert.equal(bad.isError, true);
+  assert.match(text(bad), /No ticket given, and the branch \(main\) has no Jira key/);
+  await c2.close();
 });

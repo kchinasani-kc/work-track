@@ -37,6 +37,7 @@ The manager sees five pages:
   - This happens even before the ticket's branch exists; the details are kept and shown as soon as work on it starts.
   - The title the skill writes to `.claude/jira-state/active.json` is used as a backup.
   - The hook also asks Claude to call `start_ticket` with a 1–2 sentence starting summary: what the ticket asks for and the plan.
+- **No Jira data? Claude writes it.** If a session starts on a ticket that has no title (it was never loaded from Jira), Claude is asked to write a short title, a brief description and a 1–2 sentence summary from what it knows about the work, without stopping to ask you. These show as "via Claude"; if the ticket is loaded from Jira later, the Jira title and description replace them.
 - **Tools.** The plugin's tools let Claude update the ticket. The server instructions tell Claude to do this on its own: move the ticket to review, blocked or done as the work goes, with a one-line note. Moving to a done status needs a new summary of what was actually done, which replaces the starting one.
 - **Attribution.** Every change is kept in an append-only history: who made it (their git identity), when, the note, and whether it came from Claude, from automatic detection, or from the dashboard. Waiting times are calculated from that history.
 
@@ -146,7 +147,7 @@ From then on, opening a session on a ticket branch adds the ticket to the Board.
 
 **Keep the key out of shell history.** Install without the two `--config` parts, then enter the values in Claude Code with `/plugin configure work-tracker@work-tracker`.
 
-**Branch names.** Keys are read from branch names like `feature/PROJ-123`. Until **Jira projects to track** is set, only uppercase keys count. That keeps branches like `bump-lodash-4` from showing up as tickets. Once the projects are set, lowercase keys such as `feature/proj-123` work too, and keys from other projects are ignored.
+**Branch names.** The ticket key is read from anywhere in the branch name, after any prefix: `feature/PROJ-123`, `bug/PROJ-123`, `merge/PROJ-123`, `hotfix/PROJ-123-login-fix`, or just `PROJ-123`. Claude's Work Tracker tools default to that ticket, so on such a branch Claude doesn't need to name it. Until **Jira projects to track** is set, only uppercase keys count. That keeps branches like `bump-lodash-4` from showing up as tickets. Once the projects are set, lowercase keys such as `feature/proj-123` work too, and keys from other projects are ignored.
 
 **Working without a ticket branch?** Tell Claude "I'm working on PROJ-123". It records that with the `start_ticket` tool.
 
@@ -179,7 +180,9 @@ The plugin tells Claude to keep things current on its own. People can also be di
 | `my_tickets` / `team_tickets` | The person's tickets, or anyone's |
 | `get_ticket` | Title, description, status, summary, history and time in each status |
 | `list_statuses` | The current statuses, in order |
-| `set_ticket_details` | Title and description from Jira, when the server can't read Jira itself |
+| `set_ticket_details` | Title and description when the ticket wasn't loaded from Jira (Jira text if available, otherwise written by Claude) |
+
+Every tool that takes a ticket defaults to the Jira key in the current branch name.
 
 ## What is and isn't tracked
 
