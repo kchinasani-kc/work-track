@@ -81,6 +81,7 @@ export function createTracker(db, { now = () => Date.now(), jiraBaseUrl = null }
     return {
       default_stuck_days: Number(s.default_stuck_days),
       jira_project_keys: (s.jira_project_keys || '').split(',').map((k) => k.trim()).filter(Boolean),
+      jira_site_url: s.jira_site_url || '',
       team_key: s.team_key,
     };
   }
@@ -94,6 +95,12 @@ export function createTracker(db, { now = () => Date.now(), jiraBaseUrl = null }
       const d = Number(patch.default_stuck_days);
       if (!Number.isFinite(d) || d < 0) throw new AppError('default stuck days must be 0 or more');
       await setSetting('default_stuck_days', String(d));
+    }
+    if (patch.jira_site_url !== undefined) {
+      let url = String(patch.jira_site_url ?? '').trim().replace(/\/+$/, '');
+      if (url && !/^https?:\/\//i.test(url)) url = `https://${url}`;
+      if (url && !/^https?:\/\/[^\s/]+(\/[^\s]*)?$/i.test(url)) throw new AppError('Jira site must be an address like https://yourcompany.atlassian.net');
+      await db.run('INSERT INTO wt.settings (key, value) VALUES (?, ?) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value', 'jira_site_url', url);
     }
     if (patch.jira_project_keys !== undefined) {
       const raw = Array.isArray(patch.jira_project_keys) ? patch.jira_project_keys : String(patch.jira_project_keys).split(',');
@@ -118,7 +125,7 @@ export function createTracker(db, { now = () => Date.now(), jiraBaseUrl = null }
 
   // ---- people ----
   const userCols = (p = '') =>
-    `${p}id, ${p}name, ${p}email, ${p}role, ${p}active, ${p}name_locked, ${p}created_at, ${p}password_hash IS NOT NULL AS has_password`;
+    `${p}id, ${p}name, ${p}email, ${p}role, ${p}active, ${p}name_locked, ${p}team, ${p}created_at, ${p}password_hash IS NOT NULL AS has_password`;
   const USER_COLS = userCols();
 
   async function getUser(id) {
@@ -182,6 +189,7 @@ export function createTracker(db, { now = () => Date.now(), jiraBaseUrl = null }
     const name = patch.name !== undefined ? requireText(patch.name, 'name', 100) : u.name;
     const role = patch.role ?? u.role;
     const active = patch.active !== undefined ? (patch.active ? 1 : 0) : u.active;
+    const team = patch.team !== undefined ? optionalText(patch.team, 'pod', 60) : u.team;
     if (!['member', 'manager'].includes(role)) throw new AppError('role must be member or manager');
     if ((role !== 'manager' || !active) && u.role === 'manager' && u.active && u.has_password) {
       const { n } = await db.get(
@@ -190,8 +198,8 @@ export function createTracker(db, { now = () => Date.now(), jiraBaseUrl = null }
       );
       if (n === 0) throw new AppError('this is the last manager who can sign in; add another manager first', 409);
     }
-    await db.run('UPDATE wt.users SET name = ?, role = ?, active = ?, name_locked = ? WHERE id = ?',
-      name, role, active, name !== u.name ? 1 : u.name_locked, id);
+    await db.run('UPDATE wt.users SET name = ?, role = ?, active = ?, name_locked = ?, team = ? WHERE id = ?',
+      name, role, active, name !== u.name ? 1 : u.name_locked, team, id);
     if (!active || role !== 'manager') await db.run('DELETE FROM wt.sessions WHERE user_id = ?', id);
     return getUser(id);
   }
@@ -302,14 +310,14 @@ export function createTracker(db, { now = () => Date.now(), jiraBaseUrl = null }
     return !!(await db.get('SELECT 1 AS x FROM wt.statuses WHERE lower(name) = lower(?) AND id != ?', name, exceptId));
   }
 
-  async function createStatus({ name, color = '#64748b', category = 'active', stuck_after_days = null }) {
+  async function createStatus({ name, color = '#64748b', category = 'active', stuck_after_days = null, description = null }) {
     name = requireText(name, 'status name', 40);
     if (!CATEGORIES.includes(category)) throw new AppError(`category must be one of ${CATEGORIES.join(', ')}`);
     if (await nameTaken(name)) throw new AppError(`a status named "${name}" already exists`, 409);
     const { p } = await db.get('SELECT COALESCE(MAX(position), 0) + 1 AS p FROM wt.statuses');
     const r = await db.get(
-      'INSERT INTO wt.statuses (name, color, category, position, stuck_after_days, created_at) VALUES (?, ?, ?, ?, ?, ?) RETURNING id',
-      name, validColor(color), category, p, parseStuckDays(stuck_after_days) ?? null, now()
+      'INSERT INTO wt.statuses (name, color, category, position, stuck_after_days, description, created_at) VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING id',
+      name, validColor(color), category, p, parseStuckDays(stuck_after_days) ?? null, optionalText(description, 'description', 120), now()
     );
     return getStatus(r.id);
   }
@@ -321,12 +329,13 @@ export function createTracker(db, { now = () => Date.now(), jiraBaseUrl = null }
     const category = patch.category ?? s.category;
     const stuck = patch.stuck_after_days !== undefined ? parseStuckDays(patch.stuck_after_days) : s.stuck_after_days;
     const archived = patch.archived !== undefined ? (patch.archived ? 1 : 0) : s.archived;
+    const description = patch.description !== undefined ? optionalText(patch.description, 'description', 120) : s.description;
     if (!CATEGORIES.includes(category)) throw new AppError(`category must be one of ${CATEGORIES.join(', ')}`);
     if (await nameTaken(name, id)) throw new AppError(`a status named "${name}" already exists`, 409);
     if (archived && !s.archived) throw new AppError('use the archive action so tickets in this status can be moved');
     await db.tx(async () => {
-      await db.run('UPDATE wt.statuses SET name = ?, color = ?, category = ?, stuck_after_days = ?, archived = ? WHERE id = ?',
-        name, color, category, stuck, archived, id);
+      await db.run('UPDATE wt.statuses SET name = ?, color = ?, category = ?, stuck_after_days = ?, archived = ?, description = ? WHERE id = ?',
+        name, color, category, stuck, archived, description, id);
       // Keep closed_at consistent if a status moves in or out of the done category.
       if (category !== s.category) {
         if (category === 'done') await db.run('UPDATE wt.tasks SET closed_at = COALESCE(closed_at, status_changed_at) WHERE status_id = ?', id);
@@ -579,7 +588,10 @@ export function createTracker(db, { now = () => Date.now(), jiraBaseUrl = null }
     SELECT t.*, s.name AS status_name, s.color AS status_color, s.category AS status_category,
            s.stuck_after_days AS status_stuck_after_days,
            u.name AS assignee_name, u.email AS assignee_email,
-           (SELECT e.source FROM wt.task_events e WHERE e.task_id = t.id ORDER BY e.created_at DESC, e.id DESC LIMIT 1) AS last_source
+           (SELECT e.source FROM wt.task_events e WHERE e.task_id = t.id ORDER BY e.created_at DESC, e.id DESC LIMIT 1) AS last_source,
+           (SELECT e.note FROM wt.task_events e WHERE e.task_id = t.id AND e.kind IN ('status', 'comment') AND e.note IS NOT NULL
+              ORDER BY e.created_at DESC, e.id DESC LIMIT 1) AS last_note,
+           u.team AS assignee_team
     FROM wt.tasks t
     JOIN wt.statuses s ON s.id = t.status_id
     LEFT JOIN wt.users u ON u.id = t.assignee_id`;
@@ -595,11 +607,11 @@ export function createTracker(db, { now = () => Date.now(), jiraBaseUrl = null }
       description: row.description,
       details_source: row.details_source,
       details_error: row.details_error,
-      jira_url: jiraBaseUrl ? `${jiraBaseUrl.replace(/\/+$/, '')}/browse/${row.jira_key}` : null,
+      jira_url: (settings.jira_site_url || jiraBaseUrl) ? `${(settings.jira_site_url || jiraBaseUrl).replace(/\/+$/, '')}/browse/${row.jira_key}` : null,
       work_summary: row.work_summary,
       summary_updated_at: row.summary_updated_at,
       status: { id: row.status_id, name: row.status_name, color: row.status_color, category: row.status_category },
-      assignee: row.assignee_id ? { id: row.assignee_id, name: row.assignee_name, email: row.assignee_email } : null,
+      assignee: row.assignee_id ? { id: row.assignee_id, name: row.assignee_name, email: row.assignee_email, team: row.assignee_team } : null,
       created_at: row.created_at,
       updated_at: row.updated_at,
       status_changed_at: row.status_changed_at,
@@ -608,6 +620,7 @@ export function createTracker(db, { now = () => Date.now(), jiraBaseUrl = null }
       stuck_after_days: stuckDays,
       stuck: stuckDays > 0 && inStatus > stuckDays * DAY,
       last_source: row.last_source,
+      last_note: row.last_note,
     };
   }
 
@@ -703,7 +716,7 @@ export function createTracker(db, { now = () => Date.now(), jiraBaseUrl = null }
     const users = (await listUsers()).filter((u) => u.active);
     const tasks = await listTasks({ includeDone: true, doneWithinDays: 7 });
     const people = [
-      ...users.map((u) => ({ id: u.id, name: u.name, email: u.email, role: u.role })),
+      ...users.map((u) => ({ id: u.id, name: u.name, email: u.email, role: u.role, team: u.team })),
       { id: null, name: 'Unassigned' },
     ];
     const t = now();

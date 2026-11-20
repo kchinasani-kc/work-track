@@ -10,7 +10,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 
-const SCHEMA_VERSION = '5';
+const SCHEMA_VERSION = '6';
 const INIT_LOCK = 72747_2026; // advisory lock key so parallel cold starts don't race the setup
 
 // One statement per entry (no multi-statement strings: the pooler path uses the extended protocol).
@@ -98,20 +98,24 @@ const DDL = [
   "UPDATE wt.task_events SET note = 'Started in Claude Code' WHERE kind = 'created' AND note LIKE 'Started in %' AND note != 'Started in Claude Code'",
   "UPDATE wt.task_events SET note = 'Picked up' WHERE kind = 'assigned' AND note LIKE 'Now being worked on in %'",
   "UPDATE wt.task_events SET note = 'Work resumed' WHERE kind = 'status' AND note LIKE 'Work resumed in %'",
+  // Optional team ("pod") per person, and a one-line description per status, shown on the board.
+  'ALTER TABLE wt.users ADD COLUMN IF NOT EXISTS team text',
+  'ALTER TABLE wt.statuses ADD COLUMN IF NOT EXISTS description text',
 ];
 const TABLES = ['settings', 'users', 'sessions', 'statuses', 'tasks', 'task_events', 'jira_details'];
 
 const DEFAULT_STATUSES = [
-  { name: 'To Do', color: '#64748b', category: 'todo', stuck_after_days: null },
-  { name: 'In Progress', color: '#2563eb', category: 'active', stuck_after_days: null },
-  { name: 'Blocked', color: '#dc2626', category: 'blocked', stuck_after_days: 1 },
-  { name: 'In Review', color: '#7c3aed', category: 'active', stuck_after_days: 2 },
-  { name: 'Done', color: '#16a34a', category: 'done', stuck_after_days: null },
+  { name: 'To Do', color: '#64748b', category: 'todo', stuck_after_days: null, description: 'picked up, not started' },
+  { name: 'In Progress', color: '#2563eb', category: 'active', stuck_after_days: null, description: 'being built' },
+  { name: 'Blocked', color: '#dc2626', category: 'blocked', stuck_after_days: 1, description: 'waiting on someone or something' },
+  { name: 'In Review', color: '#7c3aed', category: 'active', stuck_after_days: 2, description: 'PR open, awaiting review' },
+  { name: 'Done', color: '#16a34a', category: 'done', stuck_after_days: null, description: 'finished' },
 ];
 
 const DEFAULT_SETTINGS = {
   default_stuck_days: '3',
   jira_project_keys: '', // comma-separated; empty = accept any uppercase KEY-123 found in a branch name
+  jira_site_url: '',     // e.g. https://yourcompany.atlassian.net, for "Open in Jira" links
 };
 
 /** `?` placeholders -> `$1, $2, ...` (none of our SQL has a literal question mark). */
@@ -227,10 +231,14 @@ export async function migrate(db) {
       let pos = 1;
       for (const s of DEFAULT_STATUSES) {
         await db.run(
-          'INSERT INTO wt.statuses (name, color, category, position, stuck_after_days, created_at) VALUES (?, ?, ?, ?, ?, ?)',
-          s.name, s.color, s.category, pos++, s.stuck_after_days, now
+          'INSERT INTO wt.statuses (name, color, category, position, stuck_after_days, description, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
+          s.name, s.color, s.category, pos++, s.stuck_after_days, s.description, now
         );
       }
+    }
+    // Describe the default statuses if they still have their default names and no description.
+    for (const d of DEFAULT_STATUSES) {
+      await db.run('UPDATE wt.statuses SET description = ? WHERE lower(name) = lower(?) AND description IS NULL', d.description, d.name);
     }
     await db.run(
       "INSERT INTO wt.settings (key, value) VALUES ('schema_version', ?) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",

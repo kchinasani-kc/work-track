@@ -8,11 +8,17 @@ A small web app that shows a manager which Jira tickets each person is working o
 
 The manager sees five pages:
 
-- **Board**: one column per status. Each card shows how long the ticket has been in that status, a bar that fills toward the status's "stuck" limit, and the work summary.
+- **Board — where is each person's ticket waiting?**
+  - **Grid:** one row per person and one column per in-progress status. Each ticket sits in the status it's in today as a chip with its key, days in that status and title. Chips are coloured moving, slowing (over half the status's limit) or stuck (over the limit).
+  - **Headers:** each column shows its stuck count or "clear"; each row shows the person's pod and how many tickets they have in flight and stuck.
+  - **Tiles:** stuck tickets, the longest wait, the bottleneck status and how many people have a stuck ticket.
+  - **Side panel:** the selected ticket's status history (when it entered each status and how long it spent there), its latest note and work summary, and an "Open in Jira" link.
+  - **Below the grid:** stuck tickets as a list, oldest first, for stand-up. Filter by pod, search, or show only stuck tickets.
 - **Team**: one lane per person, with their open tickets, the wait on each, and what they finished in the last 7 days, with summaries.
 - **Waiting time**: for each status, the tickets waiting now, the longest current wait, and the average and median time spent there. Also start-to-done time and a list of stuck tickets.
-- **Statuses**: add, rename, recolour, reorder or archive statuses, and set how many days in each counts as stuck.
-- **Connect**: the team key and the copy-paste commands to set up each person.
+- **Statuses**: add, rename, recolour, reorder or archive statuses, give each a one-line description (shown under its column), and set how many days in each counts as stuck.
+- **People**: everyone who has worked on a ticket, with an optional pod for grouping.
+- **Connect**: the team key, the copy-paste commands to set up each person, the Jira site address for "Open in Jira" links, and which Jira projects to track.
 
 ## How it works
 

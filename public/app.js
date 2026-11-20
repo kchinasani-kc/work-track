@@ -14,7 +14,7 @@ const state = {
   publicUrl: null,
   pluginSource: null,
   route: 'board',
-  filters: { assignee: '', q: '', showDone: false, teamSort: 'wait', window: '30', agingAssignee: '' },
+  filters: { assignee: '', pod: '', onlyStuck: false, q: '', showDone: false, teamSort: 'wait', window: '30', agingAssignee: '' },
   lastLoaded: null,
   openTaskKey: null,
 };
@@ -74,7 +74,7 @@ function heat(task) {
   const limit = (task.stuck_after_days || 0) * DAY;
   if (!limit) return { level: '', frac: null };
   const frac = task.time_in_status_ms / limit;
-  return { level: frac >= 1 ? 'hot' : frac >= 0.6 ? 'warm' : '', frac };
+  return { level: frac >= 1 ? 'hot' : frac >= 0.5 ? 'warm' : '', frac };
 }
 
 function initials(name) {
@@ -224,59 +224,184 @@ const emptyHint = () => h('div', { class: 'panel', style: { marginTop: '16px' } 
   'No tickets yet. A ticket appears here the first time someone works on it in Claude Code, on a git branch named with its Jira key (for example ',
   h('code', null, 'feature/PROJ-123'), '). Set your team up from ', h('a', { href: '#/connect' }, 'Connect'), '.'));
 
-// ---------- board ----------
+// ---------- board: where is each person's ticket waiting? ----------
+const daysShort = (ms) => `${Math.floor((ms ?? 0) / DAY)}d`;
+const plural = (n, one, many) => `${n} ${n === 1 ? one : many}`;
+const levelOf = (t) => heat(t).level || 'moving';
+const LEVEL_LABEL = { moving: 'Moving', warm: 'Slowing', hot: 'Stuck' };
+
 async function renderBoard() {
   const f = state.filters;
   const params = new URLSearchParams();
-  if (f.assignee) params.set('assignee', f.assignee);
   if (f.q) params.set('q', f.q);
-  if (f.showDone) { params.set('include_done', '1'); params.set('done_within_days', '14'); }
-  let tasks = await api(`/tasks?${params}`);
-  const cols = activeStatuses().filter((s) => f.showDone || s.category !== 'done');
+  const all = await api(`/tasks?${params}`); // in-flight tickets only (done ones are left out)
+  const teams = [...new Set(activeUsers().map((u) => u.team).filter(Boolean))].sort();
+  if (f.pod && !teams.includes(f.pod)) f.pod = '';
+  const tasks = f.pod ? all.filter((t) => t.assignee?.team === f.pod) : all;
+  const isStuck = (t) => heat(t).level === 'hot';
+  const stuck = tasks.filter(isStuck);
+  const visible = f.onlyStuck ? stuck : tasks;
+
+  // Columns: every in-flight status in board order (plus an archived one that still holds a ticket).
+  const stages = activeStatuses().filter((s) => s.category !== 'done');
+  for (const t of tasks) if (!stages.some((s) => s.id === t.status.id)) stages.push(state.statuses.find((s) => s.id === t.status.id) ?? t.status);
+
+  // Rows: team members (in the chosen pod) plus anyone else holding tickets; Unassigned if needed.
+  let people = activeUsers().filter((u) => (u.role === 'member' || tasks.some((t) => t.assignee?.id === u.id)) && (!f.pod || u.team === f.pod));
+  for (const t of tasks) if (t.assignee && !people.some((p) => p.id === t.assignee.id)) people.push(t.assignee);
+  people = people.map((p) => ({ ...p, mine: tasks.filter((t) => t.assignee?.id === p.id) }));
+  if (tasks.some((t) => !t.assignee)) people.push({ id: null, name: 'Unassigned', mine: tasks.filter((t) => !t.assignee) });
+  if (f.onlyStuck) people = people.filter((p) => p.mine.some(isStuck));
+  people.sort((a, b) => (a.id === null) - (b.id === null) || a.name.localeCompare(b.name));
+
+  // Selected ticket: the one clicked, else the longest stall.
+  const longest = [...tasks].sort((a, b) => b.time_in_status_ms - a.time_in_status_ms)[0];
+  if (!tasks.some((t) => t.key === state.boardKey)) state.boardKey = (stuck.length ? [...stuck].sort((a, b) => b.time_in_status_ms - a.time_in_status_ms)[0] : longest)?.key ?? null;
 
   let searchTimer;
-  const head = pageHead('Board', 'Every open Jira ticket someone is working on, longest-waiting first in each column.',
+  const head = pageHead('Where is each person’s ticket waiting?', 'Every in-flight ticket, placed in the status it’s in today, with the days it has sat there. Click a ticket for its status history.',
     h('div', { class: 'toolbar' },
-      personSelect(f.assignee, (v) => { f.assignee = v; refreshView(); }),
+      teams.length ? h('select', { 'aria-label': 'Pod', value: f.pod ?? '', onchange: (e) => { f.pod = e.target.value; refreshView(); } },
+        h('option', { value: '' }, 'All pods'), teams.map((tm) => h('option', { value: tm }, tm))) : null,
       h('input', {
         type: 'search', placeholder: 'Search key, title or summary', value: f.q, 'aria-label': 'Search tickets',
-        oninput: (e) => { clearTimeout(searchTimer); searchTimer = setTimeout(() => { f.q = e.target.value.trim(); refreshView().then(() => { const s = $('#view input[type=search]'); s?.focus(); s?.setSelectionRange(s.value.length, s.value.length); }); }, 300); },
+        oninput: (e) => { clearTimeout(searchTimer); searchTimer = setTimeout(() => { f.q = e.target.value.trim(); refreshView().then(() => { const el = $('#view input[type=search]'); el?.focus(); el?.setSelectionRange(el.value.length, el.value.length); }); }, 300); },
       }),
-      h('label', { class: 'check' }, h('input', { type: 'checkbox', checked: f.showDone, onchange: (e) => { f.showDone = e.target.checked; refreshView(); } }), 'Show done (14 days)'),
+      h('label', { class: 'check' }, h('input', { type: 'checkbox', checked: !!f.onlyStuck, onchange: (e) => { f.onlyStuck = e.target.checked; refreshView(); } }), 'Only show stuck'),
       updatedLabel()));
 
-  const board = h('div', { class: 'board' }, cols.map((s) => {
-    const mine = tasks.filter((t) => t.status.id === s.id).sort((a, b) => b.time_in_status_ms - a.time_in_status_ms);
-    return h('section', { class: 'column', 'aria-label': s.name },
-      h('div', { class: 'column-head', style: { '--status-color': s.color } },
-        h('h3', null, s.name),
-        h('span', { class: 'count' }, mine.length),
-        s.effective_stuck_days ? h('span', { class: 'limit', title: 'Tickets are flagged as stuck after this long' }, `limit ${daysLabel(s.effective_stuck_days)}`) : null),
-      h('div', { class: 'cards' }, mine.length ? mine.map(card) : h('div', { class: 'empty', style: { padding: '18px 8px' } }, 'Nothing here')));
-  }));
+  // ---- summary tiles
+  const stageStuck = new Map(stages.map((s) => [s.id, stuck.filter((t) => t.status.id === s.id)]));
+  const bottleneck = stages.filter((s) => stageStuck.get(s.id).length)
+    .sort((a, b) => stageStuck.get(b.id).length - stageStuck.get(a.id).length
+      || stageStuck.get(b.id).reduce((m, t) => m + t.time_in_status_ms, 0) - stageStuck.get(a.id).reduce((m, t) => m + t.time_in_status_ms, 0))[0];
+  const inFlightPeople = people.filter((p) => p.id !== null && p.mine.length);
+  const stalledPeople = inFlightPeople.filter((p) => p.mine.some(isStuck));
+  const tile = (label, value, sub, hot) => h('div', { class: 'tile' }, h('div', { class: 'tile-label' }, label), h('div', { class: `tile-value ${hot ? 'hot' : ''}` }, value), h('div', { class: 'tile-sub' }, sub));
+  const tiles = h('div', { class: 'tiles' },
+    tile('Stuck tickets', String(stuck.length), 'over their status’s limit', stuck.length > 0),
+    tile('Longest wait', longest ? daysShort(longest.time_in_status_ms) : '–', longest ? `${longest.key} · ${longest.assignee?.name ?? 'Unassigned'} · ${longest.status.name}` : 'nothing in flight'),
+    tile('Bottleneck status', bottleneck ? bottleneck.name : 'None', bottleneck ? `${plural(stageStuck.get(bottleneck.id).length, 'stuck ticket', 'stuck tickets')} waiting here` : 'nothing is stuck'),
+    tile('People with a stuck ticket', `${stalledPeople.length} / ${inFlightPeople.length}`, `${plural(tasks.length, 'ticket', 'tickets')} in flight overall`));
 
-  const wrap = h('div', null, head, board);
-  if (!tasks.length && !f.q && !f.assignee) wrap.append(emptyHint());
+  // ---- the grid
+  const chip = (t) => {
+    const lv = levelOf(t);
+    const el = h('button', {
+      type: 'button', class: `chip ${lv} ${t.key === state.boardKey ? 'selected' : ''}`,
+      title: `${t.key} · ${titleOf(t)}\n${t.status.name} for ${fmt(t.time_in_status_ms)}`,
+      'aria-label': `${t.key} ${titleOf(t)}, ${t.status.name} for ${fmt(t.time_in_status_ms)}, ${LEVEL_LABEL[lv].toLowerCase()}`,
+    }, h('span', { class: 'chip-top' }, h('span', { class: 'chip-key' }, t.key), h('span', { class: 'chip-days' }, daysShort(t.time_in_status_ms))),
+      h('span', { class: `chip-title ${t.title ? '' : 'muted'}` }, titleOf(t)));
+    el.addEventListener('click', () => {
+      state.boardKey = t.key;
+      for (const c of document.querySelectorAll('.chip.selected')) c.classList.remove('selected');
+      el.classList.add('selected');
+      renderSide(t.key);
+      if (window.innerWidth < 1100) $('#stall-side')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    });
+    return el;
+  };
+  const grid = h('div', { class: 'stall-grid', style: { gridTemplateColumns: `200px repeat(${stages.length}, minmax(150px, 1fr))`, minWidth: `${200 + stages.length * 150}px` } },
+    h('div', { class: 'sg-corner' }, h('div', { class: 'sg-col-name' }, 'Person'), h('div', { class: 'sg-col-desc' }, 'in flight · stuck')),
+    stages.map((s) => {
+      const n = stageStuck.get(s.id).length;
+      return h('div', { class: 'sg-colhead', style: { '--status-color': s.color } },
+        h('div', { class: 'sg-col-name' }, s.name),
+        s.description ? h('div', { class: 'sg-col-desc' }, s.description) : null,
+        h('span', { class: `sg-badge ${n ? 'hot' : 'clear'}` }, n ? `${n} stuck` : 'clear'));
+    }),
+    people.map((p) => {
+      const nStuck = p.mine.filter(isStuck).length;
+      return [
+        h('div', { class: 'sg-rowhead' },
+          avatar(p.id === null ? null : p, 'lg'),
+          h('div', { class: 'sg-person' },
+            h('div', { class: 'sg-name' }, p.name),
+            p.team ? h('div', { class: 'sg-team' }, p.team) : null,
+            h('span', { class: `sg-badge ${nStuck ? 'hot' : ''}` }, `${p.mine.length} in flight${nStuck ? ` · ${nStuck} stuck` : ''}`))),
+        stages.map((s) => {
+          const here = p.mine.filter((t) => t.status.id === s.id && (!f.onlyStuck || isStuck(t))).sort((a, b) => b.time_in_status_ms - a.time_in_status_ms);
+          return h('div', { class: `sg-cell ${here.some(isStuck) ? 'has-stuck' : ''}` }, here.map(chip));
+        }),
+      ];
+    }));
+  const legend = h('div', { class: 'stall-legend' },
+    h('span', null, h('i', { class: 'chip-swatch moving' }), 'moving (under half its status’s limit)'),
+    h('span', null, h('i', { class: 'chip-swatch warm' }), 'slowing (over half)'),
+    h('span', null, h('i', { class: 'chip-swatch hot' }), 'stuck (over the limit)'),
+    h('span', { class: 'legend-note' }, 'Days = calendar days since the ticket entered its current status. Limits are set per status on the Statuses page.'));
+
+  const gridPanel = h('div', { class: 'panel stall-main' },
+    people.length && visible.length
+      ? h('div', { class: 'stall-scroll' }, grid)
+      : h('div', { class: 'empty' }, f.onlyStuck ? 'Nothing is stuck.' : (f.q || f.pod) ? 'No matching tickets.' : 'No tickets in flight.'),
+    legend);
+  const side = h('aside', { class: 'panel stall-side', id: 'stall-side' }, h('div', { class: 'empty' }, state.boardKey ? 'Loading…' : 'Click a ticket to see where it has been.'));
+
+  // ---- stuck list
+  const stuckList = h('div', { class: 'panel', style: { marginTop: '16px' } },
+    h('div', { class: 'panel-head' }, h('h2', null, 'Stuck tickets, oldest first'), h('span', { class: 'muted' }, 'Same tickets as the board, as a list for stand-up')),
+    stuck.length
+      ? h('div', { style: { overflowX: 'auto' } }, h('table', { class: 'data' },
+          h('thead', null, h('tr', null, h('th', null, 'Ticket'), h('th', null, 'Person'), h('th', null, 'Status'), h('th', { class: 'hide-sm' }, 'Since'), h('th', { class: 'num' }, 'Days'), h('th', { class: 'hide-sm' }, 'Latest note'))),
+          h('tbody', null, [...stuck].sort((a, b) => b.time_in_status_ms - a.time_in_status_ms).map((t) => h('tr', { class: 'clickable', onclick: () => { state.boardKey = t.key; refreshView().then(() => $('#stall-side')?.scrollIntoView({ behavior: 'smooth', block: 'start' })); } },
+            h('td', null, h('div', { class: 'card-key' }, t.key), h('div', null, titleOf(t))),
+            h('td', null, t.assignee?.name ?? 'Unassigned'),
+            h('td', null, statusPill(t.status)),
+            h('td', { class: 'hide-sm muted' }, dateTime(t.status_changed_at)),
+            h('td', { class: 'num' }, h('span', { class: 'stuck-flag' }, daysShort(t.time_in_status_ms))),
+            h('td', { class: 'hide-sm muted' }, t.last_note ?? '–'))))))
+      : h('div', { class: 'empty' }, 'Nothing is stuck.'));
+
+  const wrap = h('div', null, head, tiles, h('div', { class: 'stall-layout' }, gridPanel, side), stuckList);
+  if (!all.length && !f.q) wrap.append(emptyHint());
+  if (state.boardKey) setTimeout(() => renderSide(state.boardKey), 0);
   return wrap;
 }
 
-function card(t) {
-  const { level } = heat(t);
-  return h('button', {
-    class: `card ${level === 'hot' ? 'is-stuck' : ''}`, type: 'button',
-    'aria-label': `${t.key} ${titleOf(t)}. ${t.status.name} for ${fmt(t.time_in_status_ms)}${level === 'hot' ? ', stuck' : ''}. ${t.assignee?.name ?? 'Unassigned'}.`,
-    onclick: () => openTask(t.key),
-  },
-    h('div', { class: 'card-top' },
-      h('span', { class: 'card-key' }, t.key),
-      level === 'hot' ? h('span', { class: 'stuck-flag' }, 'Stuck') : null,
-      waitText(t)),
-    h('div', { class: `card-title ${t.title ? '' : 'muted'}` }, titleOf(t)),
-    t.work_summary ? h('div', { class: 'card-summary' }, t.work_summary) : null,
-    meter(t),
-    h('div', { class: 'card-foot' },
-      avatar(t.assignee),
-      h('span', { class: 'name' }, t.assignee?.name ?? 'Unassigned')));
+/** Side panel: where the selected ticket is now, and every status it has been through. */
+async function renderSide(key) {
+  const box = $('#stall-side');
+  if (!box) return;
+  let t;
+  try { t = await api(`/tasks/${encodeURIComponent(key)}`); } catch (err) { box.replaceChildren(h('div', { class: 'empty' }, err.message)); return; }
+  if (state.boardKey !== key || !$('#stall-side')) return;
+  const lv = levelOf(t);
+  const days = Math.floor(t.time_in_status_ms / DAY);
+  const enteredAt = new Map();
+  for (const e of t.events) if ((e.kind === 'created' || e.kind === 'status') && e.to_status_id) enteredAt.set(e.to_status_id, e.created_at);
+  const spent = new Map(t.time_by_status.map((x) => [x.status_id, x]));
+  const history = state.statuses.filter((s) => !s.archived || spent.has(s.id)).map((s) => {
+    const sp = spent.get(s.id);
+    const current = s.id === t.status.id;
+    return h('li', { class: `sh-item ${current ? 'current ' + lv : sp ? 'visited' : 'unreached'}` },
+      h('span', { class: 'sh-dot', style: sp ? { background: s.color, borderColor: s.color } : {} }),
+      h('div', null,
+        h('div', { class: 'sh-name' }, s.name),
+        h('div', { class: 'sh-sub' }, sp ? `entered ${dateTime(enteredAt.get(s.id))}` : 'not reached')),
+      h('span', { class: 'sh-days' }, current ? `${fmt(sp?.total_ms ?? t.time_in_status_ms)} so far` : sp ? fmt(sp.total_ms) : '—'));
+  });
+  box.replaceChildren(...[
+    h('div', { class: 'side-top' },
+      t.jira_url ? h('a', { class: 'card-key jira-link', href: t.jira_url, target: '_blank', rel: 'noopener' }, t.key) : h('span', { class: 'card-key' }, t.key),
+      h('span', { class: `level-badge ${lv}` }, LEVEL_LABEL[lv])),
+    h('h3', { class: `side-title ${t.title ? '' : 'muted'}` }, titleOf(t)),
+    h('div', { class: 'muted side-who' }, [t.assignee?.name ?? 'Unassigned', t.assignee && state.users.find((u) => u.id === t.assignee.id)?.team].filter(Boolean).join(' · ')),
+    h('div', { class: `side-now ${lv}` },
+      h('div', { class: 'section-label' }, lv === 'hot' ? 'Stuck at' : 'In'),
+      h('div', { class: 'side-stage' }, t.status.name),
+      h('div', null, 'since ', h('b', null, dateTime(t.status_changed_at)), ' · ', h('b', null, plural(days, 'day', 'days')),
+        t.stuck_after_days ? h('span', { class: 'muted' }, ` (limit ${daysLabel(t.stuck_after_days)})`) : null),
+      t.events.slice().reverse().find((e) => (e.kind === 'status' || e.kind === 'comment') && e.note)
+        ? h('div', { class: 'side-note' }, h('span', { class: 'muted' }, 'Latest note: '), t.events.slice().reverse().find((e) => (e.kind === 'status' || e.kind === 'comment') && e.note).note)
+        : null),
+    t.work_summary ? h('div', null, h('p', { class: 'section-label' }, 'Work summary'), h('div', { class: 'side-summary' }, t.work_summary)) : null,
+    h('div', null, h('p', { class: 'section-label' }, 'Status history'), h('ol', { class: 'stage-history' }, history)),
+    h('div', { class: 'side-actions' },
+      t.jira_url ? h('a', { class: 'btn primary', href: t.jira_url, target: '_blank', rel: 'noopener' }, 'Open in Jira') : null,
+      h('button', { class: 'btn', onclick: () => openTask(t.key) }, 'Full details')),
+  ].filter(Boolean));
 }
 
 // ---------- team ----------
@@ -372,7 +497,7 @@ async function renderWaiting() {
       h('th', { class: 'num hide-sm' }, 'Median'),
       h('th', { class: 'num hide-sm' }, 'Stuck after'),
       h('th', { class: 'num' }, 'Stuck'))),
-    h('tbody', null, r.statuses.map((s) => h('tr', { class: 'clickable', onclick: () => { state.filters.assignee = f.agingAssignee; location.hash = '#/board'; } },
+    h('tbody', null, r.statuses.map((s) => h('tr', null,
       h('td', null, statusPill(s.status), s.status.archived ? h('span', { class: 'muted' }, ' (archived)') : null),
       h('td', { class: 'num mono' }, s.current_count),
       h('td', { class: 'num mono hide-sm' }, fmtAvg(s.current_avg_ms)),
@@ -421,6 +546,7 @@ async function renderPeople() {
       h('div', null, h('div', { style: { fontWeight: 500 } }, u.name, u.id === state.me.id ? h('span', { class: 'muted' }, ' (you)') : null),
         h('div', { class: 'muted', style: { fontSize: '12px' } }, u.email)))),
     h('td', { class: 'hide-sm' }, u.role === 'manager' ? 'Manager' : 'Team member', !u.active ? h('div', { class: 'tag' }, 'Deactivated') : null),
+    h('td', { class: 'hide-sm' }, u.team ?? h('span', { class: 'muted' }, '–')),
     h('td', { class: 'num mono' }, u.open_tasks),
     h('td', null, h('div', { class: 'row-actions' },
       h('button', { class: 'btn sm ghost', onclick: () => editPerson(u) }, 'Edit'),
@@ -433,7 +559,7 @@ async function renderPeople() {
   return h('div', null,
     pageHead('People', 'Team members appear here automatically, named by their git name and email, the first time their Claude Code reports work.'),
     h('div', { class: 'panel', style: { overflowX: 'auto', marginBottom: '16px' } }, h('table', { class: 'data' },
-      h('thead', null, h('tr', null, h('th', null, 'Person'), h('th', { class: 'hide-sm' }, 'Role'), h('th', { class: 'num' }, 'Open'), h('th'))),
+      h('thead', null, h('tr', null, h('th', null, 'Person'), h('th', { class: 'hide-sm' }, 'Role'), h('th', { class: 'hide-sm' }, 'Pod'), h('th', { class: 'num' }, 'Open'), h('th'))),
       h('tbody', null, rows))),
     h('div', { class: 'panel' }, h('div', { class: 'panel-head' }, h('h2', null, 'Add a manager'), h('span', { class: 'muted' }, 'Managers sign in to this dashboard')), form));
 }
@@ -441,13 +567,16 @@ async function renderPeople() {
 function editPerson(u) {
   const name = h('input', { type: 'text', value: u.name });
   const role = h('select', { value: u.role }, h('option', { value: 'member' }, 'Team member'), h('option', { value: 'manager' }, 'Manager'));
+  const pods = [...new Set(state.users.map((x) => x.team).filter(Boolean))].sort();
+  const team = h('input', { type: 'text', value: u.team ?? '', placeholder: 'e.g. Pod A, Mobile', list: 'pod-list' });
   modal({
     title: `Edit ${u.name}`,
     sub: `Identified by git email ${u.email}.`,
     body: [h('label', { class: 'field' }, h('span', null, 'Display name'), name, h('small', null, 'Once you rename someone, their git name no longer overrides it.')),
+      h('label', { class: 'field' }, h('span', null, 'Pod'), team, h('datalist', { id: 'pod-list' }, pods.map((pd) => h('option', { value: pd }))), h('small', null, 'Optional. Groups people on the Board, with a Pod filter.')),
       h('label', { class: 'field' }, h('span', null, 'Role'), role, h('small', null, 'Managers can sign in to this dashboard once they have a password.'))],
     actions: (close) => [h('button', { class: 'btn ghost', onclick: close }, 'Cancel'), h('button', { class: 'btn primary', onclick: async () => {
-      try { await api(`/users/${u.id}`, { method: 'PATCH', body: { name: name.value, role: role.value } }); close(); await loadMeta(); if (u.id === state.me.id) renderShellAndRoute(); else refreshView(); toast('Saved'); } catch (err) { fail(err); }
+      try { await api(`/users/${u.id}`, { method: 'PATCH', body: { name: name.value, role: role.value, team: team.value } }); close(); await loadMeta(); if (u.id === state.me.id) renderShellAndRoute(); else refreshView(); toast('Saved'); } catch (err) { fail(err); }
     } }, 'Save')],
   });
 }
@@ -490,6 +619,9 @@ async function renderConnect() {
     e.preventDefault();
     try { await api('/settings', { method: 'PATCH', body: Object.fromEntries(new FormData(e.target)) }); await loadMeta(); refreshView(); toast('Settings saved'); } catch (err) { fail(err); }
   } },
+    h('label', { class: 'field' }, h('span', null, 'Jira site'),
+      h('input', { type: 'text', name: 'jira_site_url', value: s.jira_site_url ?? '', placeholder: 'https://yourcompany.atlassian.net' }),
+      h('small', null, 'Used for “Open in Jira” links. Nothing is ever changed in Jira.')),
     h('label', { class: 'field' }, h('span', null, 'Jira projects to track'),
       h('input', { type: 'text', name: 'jira_project_keys', value: s.jira_project_keys.join(', '), placeholder: 'e.g. PROJ, OPS' }),
       h('small', null, 'Only branches with these project keys are tracked, in upper or lower case. Empty: any uppercase key like PROJ-123 counts.')),
@@ -569,6 +701,7 @@ async function renderStatuses() {
         h('button', { 'aria-label': `Move ${s.name} down`, disabled: i === live.length - 1, onclick: () => move(i, 1) }, '▼'))),
       h('td', null, h('input', { type: 'color', value: s.color, 'aria-label': `${s.name} colour`, onchange: (e) => save(s, { color: e.target.value }) })),
       h('td', null, h('input', { type: 'text', value: s.name, 'aria-label': 'Status name', onchange: (e) => save(s, { name: e.target.value }) })),
+      h('td', null, h('input', { type: 'text', value: s.description ?? '', placeholder: 'e.g. PR open, awaiting review', 'aria-label': 'Description', maxlength: '120', onchange: (e) => save(s, { description: e.target.value }) })),
       h('td', null, cat),
       h('td', null, s.category === 'done'
         ? h('span', { class: 'muted' }, 'n/a')
@@ -586,6 +719,7 @@ async function renderStatuses() {
   } },
     h('label', { class: 'field', style: { flex: '0 0 auto', minWidth: '0' } }, h('span', null, 'Colour'), h('input', { type: 'color', name: 'color', value: '#0ea5e9' })),
     h('label', { class: 'field' }, h('span', null, 'Name'), h('input', { type: 'text', name: 'name', required: true, placeholder: 'e.g. Waiting for client' })),
+    h('label', { class: 'field' }, h('span', null, 'Description'), h('input', { type: 'text', name: 'description', maxlength: '120', placeholder: 'shown under the column on the Board' })),
     h('label', { class: 'field', style: { flex: '0 0 140px', minWidth: '0' } }, h('span', null, 'Category'), catOptions('active', 'category')),
     h('label', { class: 'field', style: { flex: '0 0 150px', minWidth: '0' } }, h('span', null, 'Stuck after (days)'), h('input', { type: 'number', name: 'stuck_after_days', min: '0', step: '0.5', placeholder: `default ${def}` })),
     h('button', { class: 'btn primary', type: 'submit' }, 'Add status'));
@@ -601,7 +735,7 @@ async function renderStatuses() {
   return h('div', null,
     pageHead('Statuses', 'The tracker’s own statuses, in board order. Claude uses these names when it updates a ticket; Jira’s statuses are not used. Renaming keeps all past history.'),
     h('div', { class: 'panel', style: { overflowX: 'auto', marginBottom: '16px' } }, h('table', { class: 'data' },
-      h('thead', null, h('tr', null, h('th'), h('th'), h('th', null, 'Name'), h('th', null, 'Category'),
+      h('thead', null, h('tr', null, h('th'), h('th'), h('th', null, 'Name'), h('th', null, 'Description'), h('th', null, 'Category'),
         h('th', { title: 'A ticket in this status for longer than this is flagged as stuck. Empty uses the default; 0 means never.' }, 'Stuck after (days)'),
         h('th', { class: 'num' }, 'Tickets'), h('th'))),
       h('tbody', null, rows)),

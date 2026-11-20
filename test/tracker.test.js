@@ -240,3 +240,38 @@ test('details for a ticket loaded before anyone works on it are kept and applied
   assert.equal(t71.description, 'Jira body');
   assert.equal((await db.get('SELECT COUNT(*) AS n FROM wt.jira_details')).n, 2);
 });
+
+test('board fields: pod, status descriptions, Jira link, latest note', async (t) => {
+  const { tracker } = await setup(t);
+  const { person } = await at(tracker, ravi, 'PROJ-1');
+  await tracker.updateUser(person.id, { team: 'Pod A' });
+  const ip = await tracker.resolveStatus('In Progress');
+  assert.equal(ip.description, 'being built');
+  await tracker.updateStatus(ip.id, { description: 'coding on the ticket branch' });
+  const qa = await tracker.createStatus({ name: 'QA', category: 'active', description: 'on dev, QA testing' });
+  assert.equal(qa.description, 'on dev, QA testing');
+  await tracker.changeStatus('PROJ-1', 'Blocked', { note: 'Waiting on API keys from the carrier' }, person, 'claude');
+  await tracker.addComment('PROJ-1', 'Chased them again', person, 'claude');
+  await tracker.setSummary('PROJ-1', 'Not a note', person, 'claude');
+  let [task] = await tracker.listTasks();
+  assert.equal(task.assignee.team, 'Pod A');
+  assert.equal(task.last_note, 'Chased them again', 'latest status/comment note, not the summary');
+  assert.equal(task.jira_url, 'https://acme.atlassian.net/browse/PROJ-1', 'falls back to the server setting');
+  await tracker.updateSettings({ jira_site_url: 'kcoverseas.atlassian.net/' });
+  assert.equal((await tracker.getSettings()).jira_site_url, 'https://kcoverseas.atlassian.net');
+  [task] = await tracker.listTasks();
+  assert.equal(task.jira_url, 'https://kcoverseas.atlassian.net/browse/PROJ-1');
+  await assert.rejects(tracker.updateSettings({ jira_site_url: 'not a url at all' }), /Jira site must be/);
+  assert.equal((await tracker.teamSummary()).people.find((p) => p.id === person.id).team, 'Pod A');
+});
+
+test('upgrading from schema 5 adds pods and status descriptions', async (t) => {
+  const { tracker, db } = await setup(t);
+  await db.run('ALTER TABLE wt.users DROP COLUMN team');
+  await db.run('ALTER TABLE wt.statuses DROP COLUMN description');
+  await db.run("UPDATE wt.settings SET value = '5' WHERE key = 'schema_version'");
+  await migrate(db);
+  assert.equal((await tracker.resolveStatus('Blocked')).description, 'waiting on someone or something');
+  const { person } = await at(tracker, ravi, 'PROJ-1');
+  assert.equal((await tracker.updateUser(person.id, { team: 'Mobile' })).team, 'Mobile');
+});

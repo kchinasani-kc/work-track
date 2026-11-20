@@ -45,6 +45,12 @@ const script = [
     [[null, 3 * D, 'Raising limit to 25 MB and chunking uploads'], ['In Review', 20 * H, 'PR up']], 3 * 60000],
   ['OPS-255', 'Port container ETA alerts', 'Alert account managers when a container ETA slips by more than a day.', 'Vikram', 3,
     [[null, 4 * D, 'Polling carrier API'], ['Blocked', 3 * D, 'Carrier API keys not issued yet']], 3 * D],
+  ['UI-62', 'Rate card editor: bulk import from CSV', 'Let account managers upload a CSV of lane rates instead of typing them in.', 'Neha', 2,
+    [[null, 2 * D + 4 * H, 'Parsing done, wiring up validation']], 0],
+  ['FIN-84', 'Credit note PDF footer shows wrong GSTIN', 'The footer pulls the default entity GSTIN instead of the branch one.', 'Priya', 0,
+    [[null, 3 * D], ['In Review', 30 * H, 'PR #102 up, needs a finance sign-off']], 0],
+  ['OPS-260', 'Duplicate carrier webhooks create double events', 'Idempotency key is ignored on retries from one carrier.', 'Arjun', 1,
+    [[null, 10 * H, 'Reproduced with the carrier sandbox']], 0],
   ['UI-60', 'Shipment list: sticky table header', 'Keep the header visible while scrolling long shipment lists.', 'Vikram', 3,
     [[null, 26 * H], ['To Do', 20 * H, 'Parked until OPS-255 is unblocked']], 20 * H],
 ];
@@ -62,6 +68,9 @@ for (const [key, title, desc, who, , steps] of script) {
   }
 }
 clock = Date.now();
+// Pods, so the Board's pod filter has something to show.
+const pods = { 'priya@example.com': 'Pod B', 'arjun@example.com': 'Pod A', 'neha@example.com': 'Pod A', 'vikram@example.com': 'Mobile' };
+for (const u of await tr.listUsers()) if (pods[u.email]) await tr.updateUser(u.id, { team: pods[u.email] });
 await db.close();
 console.log(`Demo data written to ${dir}`);
 console.log('Sign in with admin@localhost / demo-password');
