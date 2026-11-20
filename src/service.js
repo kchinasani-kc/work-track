@@ -1,0 +1,813 @@
+import crypto from 'node:crypto';
+import { tx } from './db.js';
+
+export const CATEGORIES = ['todo', 'active', 'blocked', 'done'];
+export const SOURCES = ['claude', 'hook', 'web', 'system'];
+
+const DAY = 86_400_000;
+const SESSION_TTL = 30 * DAY;
+const KEY_RE = /^[A-Z][A-Z0-9_]*-\d+$/;
+
+export class AppError extends Error {
+  constructor(message, status = 400, details = undefined) {
+    super(message);
+    this.status = status;
+    this.details = details;
+  }
+}
+
+// ---------- small helpers ----------
+
+const norm = (s) => String(s ?? '').toLowerCase().replace(/[\s_\-]+/g, '');
+const sha256 = (s) => crypto.createHash('sha256').update(s).digest('hex');
+const clean = (s) => (typeof s === 'string' ? s.trim() : s);
+
+function hashPassword(password) {
+  const salt = crypto.randomBytes(16);
+  const hash = crypto.scryptSync(password, salt, 64);
+  return `scrypt$${salt.toString('base64')}$${hash.toString('base64')}`;
+}
+
+function checkPassword(password, stored) {
+  if (!stored) return false;
+  const [scheme, saltB64, hashB64] = stored.split('$');
+  if (scheme !== 'scrypt') return false;
+  const expected = Buffer.from(hashB64, 'base64');
+  const actual = crypto.scryptSync(password, Buffer.from(saltB64, 'base64'), expected.length);
+  return crypto.timingSafeEqual(expected, actual);
+}
+
+function requireText(value, field, max = 500) {
+  const v = clean(value);
+  if (!v) throw new AppError(`${field} is required`);
+  if (v.length > max) throw new AppError(`${field} must be at most ${max} characters`);
+  return v;
+}
+
+function optionalText(value, field, max) {
+  const v = clean(value);
+  if (!v) return null;
+  if (v.length > max) throw new AppError(`${field} must be at most ${max} characters`);
+  return v;
+}
+
+function validColor(c) {
+  if (!/^#[0-9a-fA-F]{6}$/.test(c)) throw new AppError('color must be a hex value like #2563eb');
+  return c.toLowerCase();
+}
+
+export function formatDuration(ms) {
+  if (ms == null) return '';
+  const m = Math.floor(ms / 60000);
+  if (m < 1) return 'under a minute';
+  if (m < 60) return `${m}m`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h}h ${m % 60}m`;
+  const d = Math.floor(h / 24);
+  return `${d}d ${h % 24}h`;
+}
+
+/**
+ * Turn the raw environment values a Claude Code hook sends into a readable app name.
+ * Only `claude-desktop` is a confirmed entrypoint value; everything else is best effort,
+ * and the raw string is kept alongside so it can be checked later.
+ */
+export function appLabel(info = {}) {
+  const entry = String(info.entrypoint ?? '').toLowerCase();
+  const bundle = String(info.bundle ?? '').toLowerCase();
+  const term = String(info.term_program ?? '').toLowerCase();
+  const isCursor = bundle.includes('todesktop') || bundle.includes('cursor') || info.cursor === true;
+  const isVsCode = bundle.includes('com.microsoft.vscode');
+  if (entry === 'claude-desktop' || bundle === 'com.anthropic.claudefordesktop') return 'Claude desktop';
+  if (isCursor) return 'Cursor';
+  if (isVsCode || entry.includes('vscode')) return 'VS Code';
+  if (term === 'vscode') return 'VS Code';
+  if (entry === 'cli') return 'Terminal';
+  if (entry.startsWith('sdk')) return 'Claude Code (SDK)';
+  return 'Claude Code';
+}
+
+// ---------- tracker ----------
+
+/**
+ * Domain logic shared by the dashboard API and the Claude Code API.
+ * The acting person always comes from the caller's session or git identity,
+ * never from free-form request fields.
+ */
+export function createTracker(db, { now = () => Date.now(), jiraBaseUrl = null } = {}) {
+  // ---- settings ----
+  function getSettings() {
+    const rows = db.prepare('SELECT key, value FROM settings').all();
+    const s = Object.fromEntries(rows.map((r) => [r.key, r.value]));
+    return {
+      default_stuck_days: Number(s.default_stuck_days),
+      active_minutes: Number(s.active_minutes),
+      jira_project_keys: (s.jira_project_keys || '').split(',').map((k) => k.trim()).filter(Boolean),
+      team_key: s.team_key,
+    };
+  }
+
+  function updateSettings(patch) {
+    const upd = db.prepare('UPDATE settings SET value = ? WHERE key = ?');
+    if (patch.default_stuck_days !== undefined) {
+      const d = Number(patch.default_stuck_days);
+      if (!Number.isFinite(d) || d < 0) throw new AppError('default stuck days must be 0 or more');
+      upd.run(String(d), 'default_stuck_days');
+    }
+    if (patch.active_minutes !== undefined) {
+      const m = Number(patch.active_minutes);
+      if (!Number.isFinite(m) || m < 1 || m > 24 * 60) throw new AppError('"working now" window must be between 1 and 1440 minutes');
+      upd.run(String(m), 'active_minutes');
+    }
+    if (patch.jira_project_keys !== undefined) {
+      const raw = Array.isArray(patch.jira_project_keys) ? patch.jira_project_keys : String(patch.jira_project_keys).split(',');
+      const keys = [...new Set(raw.map((k) => String(k).trim().toUpperCase()).filter(Boolean))];
+      for (const k of keys) if (!/^[A-Z][A-Z0-9_]*$/.test(k)) throw new AppError(`"${k}" is not a Jira project key`);
+      upd.run(keys.join(','), 'jira_project_keys');
+    }
+    return getSettings();
+  }
+
+  function regenerateTeamKey() {
+    const key = `wtk_${crypto.randomBytes(18).toString('base64url')}`;
+    db.prepare("UPDATE settings SET value = ? WHERE key = 'team_key'").run(key);
+    return key;
+  }
+
+  function checkTeamKey(key) {
+    const expected = Buffer.from(getSettings().team_key);
+    const given = Buffer.from(String(key ?? ''));
+    return given.length === expected.length && crypto.timingSafeEqual(given, expected);
+  }
+
+  // ---- people ----
+  const userCols = (p = '') =>
+    `${p}id, ${p}name, ${p}email, ${p}role, ${p}active, ${p}name_locked, ${p}last_seen_at, ${p}last_app, ${p}created_at, ${p}password_hash IS NOT NULL AS has_password`;
+  const USER_COLS = userCols();
+
+  function getUser(id) {
+    const u = db.prepare(`SELECT ${USER_COLS} FROM users WHERE id = ?`).get(id);
+    if (!u) throw new AppError('person not found', 404);
+    return u;
+  }
+
+  function activeWindowStart() {
+    return now() - getSettings().active_minutes * 60_000;
+  }
+
+  function listUsers() {
+    const since = activeWindowStart();
+    const users = db
+      .prepare(
+        `SELECT ${userCols('u.')},
+           (SELECT COUNT(*) FROM tasks t JOIN statuses s ON s.id = t.status_id
+              WHERE t.assignee_id = u.id AND s.category != 'done') AS open_tasks
+         FROM users u ORDER BY u.active DESC, u.name COLLATE NOCASE`
+      )
+      .all();
+    const current = db.prepare(
+      `SELECT a.app, a.last_at, t.jira_key, t.title FROM activity a JOIN tasks t ON t.id = a.task_id
+       WHERE a.user_id = ? AND a.last_at >= ? ORDER BY a.last_at DESC LIMIT 1`
+    );
+    return users.map((u) => ({ ...u, working_on: current.get(u.id, since) ?? null }));
+  }
+
+  function validEmail(email) {
+    const e = clean(email);
+    if (!e || !/^[^\s@]+@[^\s@]+$/.test(e) || e.length > 200) {
+      throw new AppError('a git email is required (set it with: git config --global user.email you@company.com)', 400);
+    }
+    return e.toLowerCase();
+  }
+
+  /** Find or create the person behind a git identity. */
+  function upsertPerson({ email, name }) {
+    const e = validEmail(email);
+    const n = optionalText(name, 'name', 100);
+    const existing = db.prepare('SELECT * FROM users WHERE email = ?').get(e);
+    if (existing) {
+      if (!existing.active) throw new AppError(`${e} has been deactivated in Work Tracker`, 403);
+      if (n && !existing.name_locked && n !== existing.name) db.prepare('UPDATE users SET name = ? WHERE id = ?').run(n, existing.id);
+      return getUser(existing.id);
+    }
+    const r = db
+      .prepare('INSERT INTO users (name, email, role, created_at) VALUES (?, ?, ?, ?)')
+      .run(n || e.split('@')[0], e, 'member', now());
+    return getUser(Number(r.lastInsertRowid));
+  }
+
+  function createManager({ name, email, password }) {
+    const e = validEmail(email);
+    const n = requireText(name, 'name', 100);
+    if (!password || String(password).length < 8) throw new AppError('password must be at least 8 characters');
+    const existing = db.prepare('SELECT id FROM users WHERE email = ?').get(e);
+    if (existing) {
+      db.prepare("UPDATE users SET role = 'manager', active = 1, password_hash = ? WHERE id = ?").run(hashPassword(String(password)), existing.id);
+      return getUser(existing.id);
+    }
+    const r = db
+      .prepare("INSERT INTO users (name, email, role, password_hash, name_locked, created_at) VALUES (?, ?, 'manager', ?, 1, ?)")
+      .run(n, e, hashPassword(String(password)), now());
+    return getUser(Number(r.lastInsertRowid));
+  }
+
+  function updateUser(id, patch) {
+    const u = getUser(id);
+    const name = patch.name !== undefined ? requireText(patch.name, 'name', 100) : u.name;
+    const role = patch.role ?? u.role;
+    const active = patch.active !== undefined ? (patch.active ? 1 : 0) : u.active;
+    if (!['member', 'manager'].includes(role)) throw new AppError('role must be member or manager');
+    if ((role !== 'manager' || !active) && u.role === 'manager' && u.active && u.has_password) {
+      const { n } = db
+        .prepare("SELECT COUNT(*) AS n FROM users WHERE role = 'manager' AND active = 1 AND password_hash IS NOT NULL AND id != ?")
+        .get(id);
+      if (n === 0) throw new AppError('this is the last manager who can sign in; add another manager first', 409);
+    }
+    db.prepare('UPDATE users SET name = ?, role = ?, active = ?, name_locked = ? WHERE id = ?').run(
+      name, role, active, name !== u.name ? 1 : u.name_locked, id
+    );
+    if (!active || role !== 'manager') db.prepare('DELETE FROM sessions WHERE user_id = ?').run(id);
+    return getUser(id);
+  }
+
+  function setPassword(id, password) {
+    const u = getUser(id);
+    if (!password || String(password).length < 8) throw new AppError('password must be at least 8 characters');
+    if (u.role !== 'manager') throw new AppError('only managers sign in to the dashboard');
+    db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(hashPassword(String(password)), id);
+    db.prepare('DELETE FROM sessions WHERE user_id = ?').run(id);
+  }
+
+  function login(email, password) {
+    const row = db
+      .prepare("SELECT id, password_hash FROM users WHERE email = ? AND active = 1 AND role = 'manager'")
+      .get(String(clean(email) ?? '').toLowerCase());
+    if (!row || !checkPassword(String(password ?? ''), row.password_hash)) {
+      throw new AppError('wrong email or password', 401);
+    }
+    const sid = crypto.randomBytes(32).toString('base64url');
+    db.prepare('DELETE FROM sessions WHERE expires_at < ?').run(now());
+    db.prepare('INSERT INTO sessions (id, user_id, expires_at) VALUES (?, ?, ?)').run(sha256(sid), row.id, now() + SESSION_TTL);
+    return { sid, user: getUser(row.id), maxAgeMs: SESSION_TTL };
+  }
+
+  function sessionUser(sid) {
+    if (!sid) return null;
+    return (
+      db
+        .prepare(
+          `SELECT ${userCols('u.')}
+           FROM sessions s JOIN users u ON u.id = s.user_id
+           WHERE s.id = ? AND s.expires_at > ? AND u.active = 1 AND u.role = 'manager'`
+        )
+        .get(sha256(sid), now()) ?? null
+    );
+  }
+
+  function logout(sid) {
+    if (sid) db.prepare('DELETE FROM sessions WHERE id = ?').run(sha256(sid));
+  }
+
+  /** Ensure at least one manager can sign in. Returns credentials if one was created. */
+  function ensureManager({ email = 'admin@localhost', password } = {}) {
+    const existing = db.prepare("SELECT 1 FROM users WHERE role = 'manager' AND active = 1 AND password_hash IS NOT NULL").get();
+    if (existing) return null;
+    const pw = password || crypto.randomBytes(9).toString('base64url');
+    createManager({ name: 'Manager', email, password: pw });
+    return { email, password: pw, generated: !password };
+  }
+
+  // ---- statuses ----
+  function effectiveStuckDays(status, settings = getSettings()) {
+    if (status.category === 'done') return 0;
+    if (status.stuck_after_days == null) return settings.default_stuck_days || 0;
+    return status.stuck_after_days;
+  }
+
+  function listStatuses({ includeArchived = true } = {}) {
+    const settings = getSettings();
+    return db
+      .prepare(
+        `SELECT s.*, (SELECT COUNT(*) FROM tasks t WHERE t.status_id = s.id) AS task_count
+         FROM statuses s ${includeArchived ? '' : 'WHERE s.archived = 0'}
+         ORDER BY s.archived, s.position, s.id`
+      )
+      .all()
+      .map((s) => ({ ...s, effective_stuck_days: effectiveStuckDays(s, settings) }));
+  }
+
+  function getStatus(id) {
+    const s = db.prepare('SELECT * FROM statuses WHERE id = ?').get(id);
+    if (!s) throw new AppError('status not found', 404);
+    return s;
+  }
+
+  function resolveStatus(ref) {
+    const all = db.prepare('SELECT * FROM statuses WHERE archived = 0 ORDER BY position').all();
+    const valid = () => all.map((s) => `"${s.name}" (${s.category})`).join(', ');
+    if (ref == null || ref === '') throw new AppError(`status is required. Valid statuses: ${valid()}`);
+    if (typeof ref === 'number' || /^\d+$/.test(String(ref))) {
+      const byId = all.find((s) => s.id === Number(ref));
+      if (byId) return byId;
+    }
+    const n = norm(ref);
+    const match = all.find((s) => norm(s.name) === n);
+    if (match) return match;
+    throw new AppError(`unknown status "${ref}". Valid statuses: ${valid()}`, 400, { valid_statuses: all.map((s) => s.name) });
+  }
+
+  function parseStuckDays(v) {
+    if (v === undefined) return undefined;
+    if (v === null || v === '') return null;
+    const d = Number(v);
+    if (!Number.isFinite(d) || d < 0) throw new AppError('stuck after days must be empty or 0 or more');
+    return d;
+  }
+
+  function createStatus({ name, color = '#64748b', category = 'active', stuck_after_days = null }) {
+    name = requireText(name, 'status name', 40);
+    if (!CATEGORIES.includes(category)) throw new AppError(`category must be one of ${CATEGORIES.join(', ')}`);
+    if (db.prepare('SELECT 1 FROM statuses WHERE name = ?').get(name)) throw new AppError(`a status named "${name}" already exists`, 409);
+    const { p } = db.prepare('SELECT COALESCE(MAX(position), 0) + 1 AS p FROM statuses').get();
+    const r = db
+      .prepare('INSERT INTO statuses (name, color, category, position, stuck_after_days, created_at) VALUES (?, ?, ?, ?, ?, ?)')
+      .run(name, validColor(color), category, p, parseStuckDays(stuck_after_days) ?? null, now());
+    return getStatus(Number(r.lastInsertRowid));
+  }
+
+  function updateStatus(id, patch) {
+    const s = getStatus(id);
+    const name = patch.name !== undefined ? requireText(patch.name, 'status name', 40) : s.name;
+    const color = patch.color !== undefined ? validColor(patch.color) : s.color;
+    const category = patch.category ?? s.category;
+    const stuck = patch.stuck_after_days !== undefined ? parseStuckDays(patch.stuck_after_days) : s.stuck_after_days;
+    const archived = patch.archived !== undefined ? (patch.archived ? 1 : 0) : s.archived;
+    if (!CATEGORIES.includes(category)) throw new AppError(`category must be one of ${CATEGORIES.join(', ')}`);
+    if (db.prepare('SELECT 1 FROM statuses WHERE name = ? AND id != ?').get(name, id)) throw new AppError(`a status named "${name}" already exists`, 409);
+    if (archived && !s.archived) throw new AppError('use the archive action so tickets in this status can be moved');
+    tx(db, () => {
+      db.prepare('UPDATE statuses SET name = ?, color = ?, category = ?, stuck_after_days = ?, archived = ? WHERE id = ?').run(
+        name, color, category, stuck, archived, id
+      );
+      // Keep closed_at consistent if a status moves in or out of the done category.
+      if (category !== s.category) {
+        if (category === 'done') db.prepare('UPDATE tasks SET closed_at = COALESCE(closed_at, status_changed_at) WHERE status_id = ?').run(id);
+        else db.prepare('UPDATE tasks SET closed_at = NULL WHERE status_id = ?').run(id);
+      }
+    });
+    return getStatus(id);
+  }
+
+  function reorderStatuses(ids) {
+    if (!Array.isArray(ids) || ids.length === 0) throw new AppError('ids must be a non-empty list');
+    tx(db, () => {
+      const upd = db.prepare('UPDATE statuses SET position = ? WHERE id = ?');
+      ids.forEach((id, i) => upd.run(i + 1, Number(id)));
+    });
+    return listStatuses();
+  }
+
+  function archiveStatus(id, { moveTo } = {}, actor) {
+    const s = getStatus(id);
+    if (s.archived) return s;
+    const { n: remaining } = db.prepare('SELECT COUNT(*) AS n FROM statuses WHERE archived = 0 AND id != ?').get(id);
+    if (remaining === 0) throw new AppError('you need at least one status');
+    const tasks = db.prepare('SELECT id FROM tasks WHERE status_id = ?').all(id);
+    if (tasks.length && moveTo == null) {
+      throw new AppError(`${tasks.length} ticket(s) are in "${s.name}". Choose a status to move them to.`, 409, { task_count: tasks.length });
+    }
+    tx(db, () => {
+      if (tasks.length) {
+        const target = getStatus(Number(moveTo));
+        if (target.archived || target.id === s.id) throw new AppError('pick an active status to move tickets to');
+        for (const t of tasks) moveStatus(t.id, target, `Moved because status "${s.name}" was archived`, actor, 'web');
+      }
+      db.prepare('UPDATE statuses SET archived = 1 WHERE id = ?').run(id);
+    });
+    return getStatus(id);
+  }
+
+  /** Status a ticket gets when someone starts working on it: the first active status. */
+  function startStatus() {
+    return (
+      db.prepare("SELECT * FROM statuses WHERE archived = 0 AND category = 'active' ORDER BY position LIMIT 1").get() ??
+      db.prepare('SELECT * FROM statuses WHERE archived = 0 ORDER BY position LIMIT 1').get()
+    );
+  }
+
+  // ---- tickets ----
+
+  /** Validate a Jira key and check it belongs to a tracked project. */
+  function normalizeKey(ref, { strictCase = false } = {}) {
+    const raw = String(ref ?? '').trim();
+    const k = raw.toUpperCase();
+    if (!KEY_RE.test(k)) throw new AppError(`"${ref}" is not a Jira ticket key like PROJ-123`);
+    const allowed = getSettings().jira_project_keys;
+    if (allowed.length && !allowed.includes(k.split('-')[0])) {
+      throw new AppError(`${k} is not in a tracked Jira project (${allowed.join(', ')})`, 422);
+    }
+    // Without a project list, a lowercase match in a branch name (e.g. lodash-4) is too likely to be noise.
+    if (strictCase && !allowed.length && raw !== k) {
+      throw new AppError(`${raw} isn't uppercase; set "Jira projects to track" to accept lowercase branch names`, 422);
+    }
+    return k;
+  }
+
+  function findTaskId(ref) {
+    const q = String(ref ?? '').trim();
+    if (!q) throw new AppError('ticket is required');
+    const row = db.prepare('SELECT id FROM tasks WHERE jira_key = ?').get(q.toUpperCase());
+    if (row) return row.id;
+    throw new AppError(
+      `${q.toUpperCase()} isn't in the tracker yet. It is added when someone works on it in Claude Code (on a branch named with the key), or with start_ticket.`,
+      404
+    );
+  }
+
+  function insertEvent(e) {
+    db.prepare(
+      `INSERT INTO task_events (task_id, kind, from_status_id, to_status_id, from_user_id, to_user_id, actor_id, source, note, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(
+      e.task_id, e.kind, e.from_status_id ?? null, e.to_status_id ?? null, e.from_user_id ?? null, e.to_user_id ?? null,
+      e.actor_id ?? null, e.source, e.note ?? null, e.created_at ?? now()
+    );
+  }
+
+  function checkSource(source) {
+    if (!SOURCES.includes(source)) throw new AppError('bad source');
+  }
+
+  /** Inner status move; caller provides the transaction. */
+  function moveStatus(taskId, status, note, actor, source) {
+    const task = db.prepare('SELECT * FROM tasks WHERE id = ?').get(taskId);
+    if (task.status_id === status.id) return false;
+    const t = now();
+    db.prepare('UPDATE tasks SET status_id = ?, status_changed_at = ?, updated_at = ?, closed_at = ? WHERE id = ?').run(
+      status.id, t, t, status.category === 'done' ? t : null, taskId
+    );
+    insertEvent({ task_id: taskId, kind: 'status', from_status_id: task.status_id, to_status_id: status.id, actor_id: actor?.id, source, note: clean(note) || null, created_at: t });
+    return true;
+  }
+
+  /**
+   * A Claude Code session reported work on a ticket. The first report creates the ticket
+   * in the first active status (so its clock starts); later reports only record who is on
+   * it, where, and when. A ticket sitting in a to-do status is moved to active.
+   */
+  function recordActivity({ person, ticket, app, appRaw, repo, branch, sessionId, event, sessionSource }, source = 'hook') {
+    checkSource(source);
+    const key = normalizeKey(ticket, { strictCase: source === 'hook' });
+    // A ticket parked in a to-do status only restarts when a new session begins on it (or the
+    // person says they're on it via start_ticket) - not on every prompt of the session that parked it.
+    const resumes = source === 'claude' || (event === 'SessionStart' && sessionSource !== 'compact');
+    const user = upsertPerson(person);
+    const sid = optionalText(sessionId, 'session id', 200) || `manual-${user.id}`;
+    const label = optionalText(app, 'app', 60) || 'Claude Code';
+    const t = now();
+    const result = tx(db, () => {
+      let task = db.prepare('SELECT * FROM tasks WHERE jira_key = ?').get(key);
+      let created = false;
+      const where = [label, branch ? `branch ${branch}` : null].filter(Boolean).join(', ');
+      if (!task) {
+        const status = startStatus();
+        const r = db
+          .prepare(
+            `INSERT INTO tasks (jira_key, assignee_id, status_id, created_at, updated_at, status_changed_at, closed_at, last_activity_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+          )
+          .run(key, user.id, status.id, t, t, t, status.category === 'done' ? t : null, t);
+        task = db.prepare('SELECT * FROM tasks WHERE id = ?').get(Number(r.lastInsertRowid));
+        insertEvent({ task_id: task.id, kind: 'created', to_status_id: status.id, to_user_id: user.id, actor_id: user.id, source, note: `Started in ${where}`, created_at: t });
+        created = true;
+      } else {
+        if (task.assignee_id !== user.id) {
+          db.prepare('UPDATE tasks SET assignee_id = ? WHERE id = ?').run(user.id, task.id);
+          insertEvent({ task_id: task.id, kind: 'assigned', from_user_id: task.assignee_id, to_user_id: user.id, actor_id: user.id, source, note: `Now being worked on in ${where}`, created_at: t });
+        }
+        const current = getStatus(task.status_id);
+        if (current.category === 'todo' && resumes) moveStatus(task.id, startStatus(), `Work resumed in ${where}`, user, source);
+        db.prepare('UPDATE tasks SET last_activity_at = ? WHERE id = ?').run(t, task.id);
+      }
+      db.prepare(
+        `INSERT INTO activity (task_id, user_id, session_id, app, app_raw, repo, branch, first_at, last_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT (session_id, task_id) DO UPDATE SET
+           last_at = excluded.last_at, pings = pings + 1, app = excluded.app, app_raw = excluded.app_raw,
+           repo = COALESCE(excluded.repo, repo), branch = COALESCE(excluded.branch, branch), user_id = excluded.user_id`
+      ).run(task.id, user.id, sid, label, optionalText(appRaw, 'app', 300), optionalText(repo, 'repo', 200), optionalText(branch, 'branch', 200), t, t);
+      db.prepare('UPDATE users SET last_seen_at = ?, last_app = ? WHERE id = ?').run(t, label, user.id);
+      return { id: task.id, created };
+    });
+    return { created: result.created, person: getUser(user.id), task: getTask(result.id) };
+  }
+
+  /** Title/description copied from Jira (or supplied by Claude when the server can't read Jira). */
+  function setDetails(ref, { title, description, error }, source) {
+    const id = findTaskId(ref);
+    const task = db.prepare('SELECT details_source FROM tasks WHERE id = ?').get(id);
+    if (error) {
+      db.prepare('UPDATE tasks SET details_error = ?, details_fetched_at = ? WHERE id = ?').run(String(error).slice(0, 300), now(), id);
+      return getTask(id);
+    }
+    if (source === 'claude' && task.details_source === 'jira') return getTask(id); // Jira wins
+    const t = requireText(title, 'title', 500);
+    const d = clean(description ?? '') || '';
+    db.prepare(
+      'UPDATE tasks SET title = ?, description = ?, details_source = ?, details_fetched_at = ?, details_error = NULL WHERE id = ?'
+    ).run(t, d.slice(0, 50000), source === 'jira' ? 'jira' : 'claude', now(), id);
+    return getTask(id);
+  }
+
+  function needsDetails(ref, maxAgeMs = 6 * 3_600_000) {
+    const id = findTaskId(ref);
+    const t = db.prepare('SELECT title, details_source, details_fetched_at FROM tasks WHERE id = ?').get(id);
+    if (!t.title || t.details_source !== 'jira') return true;
+    return now() - (t.details_fetched_at ?? 0) > maxAgeMs;
+  }
+
+  function changeStatus(ref, statusRef, { note, summary } = {}, actor, source) {
+    checkSource(source);
+    const id = findTaskId(ref);
+    const status = resolveStatus(statusRef);
+    const sum = optionalText(summary, 'summary', 5000);
+    if (status.category === 'done' && source === 'claude' && !sum) {
+      throw new AppError(`Moving to "${status.name}" needs a short summary of the work done. Pass it as summary.`);
+    }
+    const before = db.prepare('SELECT status_id, status_changed_at FROM tasks WHERE id = ?').get(id);
+    const changed = tx(db, () => {
+      const moved = moveStatus(id, status, note, actor, source);
+      if (sum) saveSummary(id, sum, actor, source);
+      if (!moved && clean(note)) insertEvent({ task_id: id, kind: 'comment', actor_id: actor?.id, source, note: clean(note) });
+      db.prepare('UPDATE tasks SET last_activity_at = ? WHERE id = ?').run(now(), id);
+      return moved;
+    });
+    return {
+      changed,
+      previous_status: getStatus(before.status_id).name,
+      time_in_previous_ms: changed ? now() - before.status_changed_at : null,
+      task: getTask(id),
+    };
+  }
+
+  function saveSummary(id, summary, actor, source) {
+    const t = now();
+    db.prepare('UPDATE tasks SET work_summary = ?, summary_updated_at = ?, updated_at = ? WHERE id = ?').run(summary, t, t, id);
+    insertEvent({ task_id: id, kind: 'summary', actor_id: actor?.id, source, note: summary, created_at: t });
+  }
+
+  function setSummary(ref, summary, actor, source) {
+    checkSource(source);
+    const id = findTaskId(ref);
+    const text = requireText(summary, 'summary', 5000);
+    tx(db, () => saveSummary(id, text, actor, source));
+    return getTask(id);
+  }
+
+  function addComment(ref, note, actor, source) {
+    checkSource(source);
+    const id = findTaskId(ref);
+    const text = requireText(note, 'note', 5000);
+    tx(db, () => {
+      insertEvent({ task_id: id, kind: 'comment', actor_id: actor?.id, source, note: text });
+      db.prepare('UPDATE tasks SET updated_at = ? WHERE id = ?').run(now(), id);
+    });
+    return getTask(id);
+  }
+
+  function deleteTask(ref) {
+    const id = findTaskId(ref);
+    db.prepare('DELETE FROM tasks WHERE id = ?').run(id);
+    return { deleted: true };
+  }
+
+  const TASK_SELECT = `
+    SELECT t.*, s.name AS status_name, s.color AS status_color, s.category AS status_category,
+           s.stuck_after_days AS status_stuck_after_days,
+           u.name AS assignee_name, u.email AS assignee_email,
+           (SELECT e.source FROM task_events e WHERE e.task_id = t.id ORDER BY e.created_at DESC, e.id DESC LIMIT 1) AS last_source,
+           (SELECT a.app FROM activity a WHERE a.task_id = t.id ORDER BY a.last_at DESC LIMIT 1) AS last_app
+    FROM tasks t
+    JOIN statuses s ON s.id = t.status_id
+    LEFT JOIN users u ON u.id = t.assignee_id`;
+
+  function enrich(row, settings) {
+    const t = now();
+    const inStatus = t - row.status_changed_at;
+    const stuckDays = effectiveStuckDays({ category: row.status_category, stuck_after_days: row.status_stuck_after_days }, settings);
+    return {
+      id: row.id,
+      key: row.jira_key,
+      title: row.title,
+      description: row.description,
+      details_source: row.details_source,
+      details_error: row.details_error,
+      jira_url: jiraBaseUrl ? `${jiraBaseUrl.replace(/\/+$/, '')}/browse/${row.jira_key}` : null,
+      work_summary: row.work_summary,
+      summary_updated_at: row.summary_updated_at,
+      status: { id: row.status_id, name: row.status_name, color: row.status_color, category: row.status_category },
+      assignee: row.assignee_id ? { id: row.assignee_id, name: row.assignee_name, email: row.assignee_email } : null,
+      created_at: row.created_at,
+      updated_at: row.updated_at,
+      status_changed_at: row.status_changed_at,
+      closed_at: row.closed_at,
+      last_activity_at: row.last_activity_at,
+      last_app: row.last_app,
+      working_now: row.last_activity_at != null && t - row.last_activity_at <= settings.active_minutes * 60_000,
+      time_in_status_ms: inStatus,
+      stuck_after_days: stuckDays,
+      stuck: stuckDays > 0 && inStatus > stuckDays * DAY,
+      last_source: row.last_source,
+    };
+  }
+
+  function listTasks({ assigneeId, statusId, includeDone = false, doneWithinDays, q, limit = 1000 } = {}) {
+    const where = [];
+    const args = [];
+    if (assigneeId === 'none') where.push('t.assignee_id IS NULL');
+    else if (assigneeId != null && assigneeId !== '') {
+      where.push('t.assignee_id = ?');
+      args.push(Number(assigneeId));
+    }
+    if (statusId != null && statusId !== '') {
+      where.push('t.status_id = ?');
+      args.push(Number(statusId));
+    }
+    if (!includeDone) where.push("s.category != 'done'");
+    else if (doneWithinDays) {
+      where.push("(s.category != 'done' OR t.closed_at >= ?)");
+      args.push(now() - doneWithinDays * DAY);
+    }
+    if (q) {
+      where.push('(t.jira_key LIKE ? OR t.title LIKE ? OR t.description LIKE ? OR t.work_summary LIKE ?)');
+      const like = `%${q}%`;
+      args.push(like, like, like, like);
+    }
+    const settings = getSettings();
+    return db
+      .prepare(`${TASK_SELECT} ${where.length ? 'WHERE ' + where.join(' AND ') : ''} ORDER BY t.status_changed_at ASC LIMIT ?`)
+      .all(...args, Math.min(Number(limit) || 1000, 5000))
+      .map((r) => enrich(r, settings));
+  }
+
+  function getTask(ref) {
+    const id = typeof ref === 'number' ? ref : findTaskId(ref);
+    const row = db.prepare(`${TASK_SELECT} WHERE t.id = ?`).get(id);
+    if (!row) throw new AppError('ticket not found', 404);
+    const settings = getSettings();
+    const task = enrich(row, settings);
+    const events = db
+      .prepare(
+        `SELECT e.*, a.name AS actor_name, fs.name AS from_status_name, ts.name AS to_status_name,
+                ts.color AS to_status_color, fu.name AS from_user_name, tu.name AS to_user_name
+         FROM task_events e
+         LEFT JOIN users a ON a.id = e.actor_id
+         LEFT JOIN statuses fs ON fs.id = e.from_status_id
+         LEFT JOIN statuses ts ON ts.id = e.to_status_id
+         LEFT JOIN users fu ON fu.id = e.from_user_id
+         LEFT JOIN users tu ON tu.id = e.to_user_id
+         WHERE e.task_id = ? ORDER BY e.created_at, e.id`
+      )
+      .all(id);
+    task.events = events;
+    task.time_by_status = timeByStatus(events);
+    task.sessions = db
+      .prepare(
+        `SELECT a.app, a.app_raw, a.repo, a.branch, a.first_at, a.last_at, a.pings, u.name AS person
+         FROM activity a JOIN users u ON u.id = a.user_id WHERE a.task_id = ? ORDER BY a.last_at DESC LIMIT 50`
+      )
+      .all(id);
+    return task;
+  }
+
+  /** Total time spent in each status, from the event log. */
+  function timeByStatus(events) {
+    const out = new Map();
+    const moves = events.filter((e) => e.kind === 'created' || e.kind === 'status');
+    moves.forEach((e, i) => {
+      const end = i + 1 < moves.length ? moves[i + 1].created_at : now();
+      const cur = out.get(e.to_status_id) ?? { status_id: e.to_status_id, name: e.to_status_name, color: e.to_status_color, total_ms: 0, visits: 0, current: false };
+      cur.total_ms += end - e.created_at;
+      cur.visits += 1;
+      if (i + 1 === moves.length) cur.current = true;
+      out.set(e.to_status_id, cur);
+    });
+    return [...out.values()];
+  }
+
+  // ---- reports ----
+
+  /** Every stint a ticket spent in a status: { task_id, status_id, assignee_id, start, end|null }. */
+  function allStints() {
+    const rows = db
+      .prepare(
+        `SELECT e.task_id, e.to_status_id, e.created_at, t.assignee_id
+         FROM task_events e JOIN tasks t ON t.id = e.task_id
+         WHERE e.kind IN ('created', 'status')
+         ORDER BY e.task_id, e.created_at, e.id`
+      )
+      .all();
+    const stints = [];
+    for (let i = 0; i < rows.length; i++) {
+      const r = rows[i];
+      const next = rows[i + 1];
+      const end = next && next.task_id === r.task_id ? next.created_at : null;
+      stints.push({ task_id: r.task_id, status_id: r.to_status_id, assignee_id: r.assignee_id, start: r.created_at, end });
+    }
+    return stints;
+  }
+
+  function teamSummary() {
+    const statuses = listStatuses({ includeArchived: false });
+    const users = listUsers().filter((u) => u.active);
+    const tasks = listTasks({ includeDone: true, doneWithinDays: 7 });
+    const people = [
+      ...users.map((u) => ({ id: u.id, name: u.name, email: u.email, role: u.role, last_seen_at: u.last_seen_at, last_app: u.last_app, working_on: u.working_on })),
+      { id: null, name: 'Unassigned' },
+    ];
+    const t = now();
+    const result = people.map((p) => {
+      const mine = tasks.filter((x) => (x.assignee?.id ?? null) === p.id);
+      const open = mine.filter((x) => x.status.category !== 'done');
+      const counts = Object.fromEntries(statuses.map((s) => [s.id, mine.filter((x) => x.status.id === s.id).length]));
+      const lastUpdate = mine.reduce((m, x) => Math.max(m, x.updated_at, x.last_activity_at ?? 0), 0) || null;
+      return {
+        ...p,
+        counts,
+        open: open.length,
+        stuck: open.filter((x) => x.stuck).length,
+        blocked: open.filter((x) => x.status.category === 'blocked').length,
+        done_last_7d: mine.filter((x) => x.status.category === 'done').length,
+        oldest_open_ms: open.length ? Math.max(...open.map((x) => x.time_in_status_ms)) : null,
+        last_update_at: lastUpdate,
+        last_update_ago_ms: lastUpdate ? t - lastUpdate : null,
+        tasks: open.sort((a, b) => b.time_in_status_ms - a.time_in_status_ms),
+        done: mine.filter((x) => x.status.category === 'done').sort((a, b) => b.closed_at - a.closed_at),
+      };
+    });
+    // Every team member gets a lane (an empty one is useful to see); managers and the
+    // Unassigned lane only when they actually hold work.
+    const visible = (p) => p.tasks.length || p.done_last_7d || (p.id !== null && p.role !== 'manager');
+    return { statuses, people: result.filter(visible) };
+  }
+
+  function agingReport({ windowDays = 30, assigneeId } = {}) {
+    const statuses = listStatuses({ includeArchived: true });
+    const t = now();
+    const since = windowDays ? t - windowDays * DAY : 0;
+    let stints = allStints();
+    if (assigneeId != null && assigneeId !== '') stints = stints.filter((s) => s.assignee_id === Number(assigneeId));
+    const open = listTasks({ assigneeId });
+    const median = (xs) => {
+      if (!xs.length) return null;
+      const a = [...xs].sort((x, y) => x - y);
+      const mid = Math.floor(a.length / 2);
+      return a.length % 2 ? a[mid] : (a[mid - 1] + a[mid]) / 2;
+    };
+    const rows = statuses
+      .filter((s) => s.category !== 'done')
+      .map((s) => {
+        const finished = stints.filter((x) => x.status_id === s.id && x.end != null && x.end >= since).map((x) => x.end - x.start);
+        const current = open.filter((x) => x.status.id === s.id).map((x) => x.time_in_status_ms);
+        return {
+          status: { id: s.id, name: s.name, color: s.color, category: s.category, archived: s.archived },
+          stuck_after_days: s.effective_stuck_days,
+          current_count: current.length,
+          current_avg_ms: current.length ? current.reduce((a, b) => a + b, 0) / current.length : null,
+          current_max_ms: current.length ? Math.max(...current) : null,
+          stuck_count: open.filter((x) => x.status.id === s.id && x.stuck).length,
+          finished_count: finished.length,
+          finished_avg_ms: finished.length ? finished.reduce((a, b) => a + b, 0) / finished.length : null,
+          finished_median_ms: median(finished),
+        };
+      })
+      .filter((r) => !r.status.archived || r.current_count || r.finished_count);
+
+    // Start to done: first Claude activity -> entering a done status, for tickets closed in the window.
+    const closed = db
+      .prepare(
+        `SELECT t.id, t.created_at, t.closed_at FROM tasks t JOIN statuses s ON s.id = t.status_id
+         WHERE s.category = 'done' AND t.closed_at >= ? ${assigneeId ? 'AND t.assignee_id = ?' : ''}`
+      )
+      .all(...[since, ...(assigneeId ? [Number(assigneeId)] : [])]);
+    const cycle = closed.map((c) => c.closed_at - c.created_at);
+
+    return {
+      window_days: windowDays,
+      statuses: rows,
+      stuck: open.filter((x) => x.stuck).sort((a, b) => b.time_in_status_ms - a.time_in_status_ms),
+      closed_count: closed.length,
+      cycle_avg_ms: cycle.length ? cycle.reduce((a, b) => a + b, 0) / cycle.length : null,
+      cycle_median_ms: median(cycle),
+    };
+  }
+
+  return {
+    getSettings, updateSettings, regenerateTeamKey, checkTeamKey,
+    listUsers, getUser, upsertPerson, createManager, updateUser, setPassword,
+    login, sessionUser, logout, ensureManager,
+    listStatuses, createStatus, updateStatus, reorderStatuses, archiveStatus, resolveStatus,
+    normalizeKey, recordActivity, setDetails, needsDetails, changeStatus, setSummary, addComment, deleteTask,
+    listTasks, getTask, teamSummary, agingReport,
+  };
+}

@@ -1,0 +1,23 @@
+{
+  "name": "work-tracking",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Team task tracker: manager dashboard + MCP endpoint so Claude can update task status",
+  "type": "module",
+  "engines": {
+    "node": ">=22.13"
+  },
+  "scripts": {
+    "start": "node --disable-warning=ExperimentalWarning src/server.js",
+    "dev": "node --disable-warning=ExperimentalWarning --watch src/server.js",
+    "demo": "node --disable-warning=ExperimentalWarning scripts/demo.js && DB_FILE=data/demo.db node --disable-warning=ExperimentalWarning src/server.js",
+    "admin": "node --disable-warning=ExperimentalWarning scripts/admin.js",
+    "test": "node --disable-warning=ExperimentalWarning --test test/*.test.js"
+  },
+  "dependencies": {
+    "express": "^5.2.1"
+  },
+  "devDependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.2"
+  }
+}

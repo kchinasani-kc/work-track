@@ -1,0 +1,19 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "work-tracker-demo",
+      "runtimeExecutable": "node",
+      "runtimeArgs": [
+        "--disable-warning=ExperimentalWarning",
+        "src/server.js"
+      ],
+      "env": {
+        "DB_FILE": "data/demo.db",
+        "PORT": "4100",
+        "PLUGIN_SOURCE": "/Users/kchinasani-kc/projects/office/work-tracking"
+      },
+      "port": 4100
+    }
+  ]
+}

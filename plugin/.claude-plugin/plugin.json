@@ -1,0 +1,21 @@
+{
+  "name": "work-tracker",
+  "version": "1.0.0",
+  "description": "Reports the Jira ticket you're working on in Claude Code to the team's Work Tracker, and lets Claude update its status and work summary. Jira itself is never changed.",
+  "author": {
+    "name": "Work Tracker"
+  },
+  "userConfig": {
+    "server_url": {
+      "type": "string",
+      "title": "Work Tracker address",
+      "description": "The tracker's address, e.g. http://tracker.office.local:4000 (from the Connect page of the dashboard)"
+    },
+    "team_key": {
+      "type": "string",
+      "title": "Team key",
+      "description": "The team key shown on the dashboard's Connect page",
+      "sensitive": true
+    }
+  }
+}

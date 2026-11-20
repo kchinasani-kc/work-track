@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "work-tracker": {
+      "command": "python3",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/mcp_server.py"],
+      "env": {
+        "WORK_TRACKER_URL": "${user_config.server_url}",
+        "WORK_TRACKER_KEY": "${user_config.team_key}"
+      }
+    }
+  }
+}

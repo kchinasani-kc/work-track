@@ -1,0 +1,14 @@
+{
+  "name": "work-tracker",
+  "owner": {
+    "name": "Work Tracker"
+  },
+  "description": "Work Tracker plugin for Claude Code: reports the Jira ticket you are working on and lets Claude update its status.",
+  "plugins": [
+    {
+      "name": "work-tracker",
+      "source": "./plugin",
+      "description": "Reports the Jira ticket you're working on in Claude Code to the team's Work Tracker, and lets Claude update its status and work summary."
+    }
+  ]
+}

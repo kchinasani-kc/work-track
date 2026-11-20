@@ -1,0 +1,70 @@
+// Builds a throwaway demo database: four developers working on Jira tickets in Claude Code
+// over the last two weeks, then starts the server on it. Real data (data/tracker.db) is not touched.
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { openDb } from '../src/db.js';
+import { createTracker } from '../src/service.js';
+
+const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const file = path.join(root, 'data', 'demo.db');
+for (const f of [file, `${file}-wal`, `${file}-shm`]) fs.rmSync(f, { force: true });
+
+const H = 3_600_000;
+const D = 24 * H;
+let clock = Date.now() - 14 * D;
+const tr = createTracker(openDb(file), { now: () => clock });
+const at = (msAgo) => { clock = Date.now() - msAgo; };
+
+tr.ensureManager({ email: 'admin@localhost', password: 'demo-password' });
+tr.updateSettings({ jira_project_keys: 'PORT,FIN,OPS,UI' });
+const people = {
+  Priya: { name: 'Priya Sharma', email: 'priya@example.com' },
+  Arjun: { name: 'Arjun Mehta', email: 'arjun@example.com' },
+  Neha: { name: 'Neha Iyer', email: 'neha@example.com' },
+  Vikram: { name: 'Vikram Rao', email: 'vikram@example.com' },
+};
+const apps = ['Claude desktop', 'VS Code', 'Cursor', 'Terminal'];
+
+// [key, title, description, person, app, [[status|null(start), msAgo, note, summary], ...], lastActivityAgo]
+const script = [
+  ['PORT-412', 'Partner portal login redirect loop', 'Partners on Safari bounce between /login and /home after the 2.4 release.', 'Priya', 0,
+    [[null, 13 * D], ['In Review', 9 * D, 'PR #88 open'], ['Done', 8 * D, 'Merged and deployed', 'Cleared the stale session cookie that Safari kept after logout, which caused the redirect loop. Added a regression test for the login flow.']], 8 * D],
+  ['FIN-77', 'Invoice PDF export times out for large clients', 'Exports over ~2,000 lines exceed the 30 s gateway timeout.', 'Priya', 0,
+    [[null, 5 * D, 'Profiling the export query'], ['Blocked', 2 * D - 3 * H, 'Waiting on DBA for read-replica access']], 2 * D],
+  ['FIN-81', 'Add GST number field to supplier form', 'Capture and validate the GSTIN on the supplier onboarding form.', 'Priya', 0,
+    [[null, 9 * H]], 6 * 60000],
+  ['OPS-230', 'Shipment tracking webhook retries', 'Carrier webhooks are dropped when our endpoint returns 5xx; add retries with backoff.', 'Arjun', 1,
+    [[null, 11 * D], ['In Review', 4 * D - 2 * H, 'Ready for review, waiting on Neha']], 4 * D],
+  ['OPS-198', 'Migrate cron jobs to the scheduler', 'Move the 11 legacy cron jobs to the managed scheduler.', 'Arjun', 1,
+    [[null, 7 * D, 'Moved 3 of 11 jobs']], 50 * 60000],
+  ['UI-51', 'Dashboard: filter by warehouse', 'Add a warehouse filter to the operations dashboard.', 'Neha', 2,
+    [[null, 7 * D], ['In Review', 5 * D, 'Screenshots attached to PR'], ['Done', 4 * D, 'Shipped', 'Added a warehouse multi-select to the dashboard filters and wired it to the stock and shipment queries. Filter choice is remembered per user.']], 4 * D],
+  ['OPS-241', 'Customs document upload size limit', 'Uploads over 10 MB fail; raise the limit and chunk large files.', 'Neha', 2,
+    [[null, 3 * D, 'Raising limit to 25 MB and chunking uploads'], ['In Review', 20 * H, 'PR up']], 3 * 60000],
+  ['OPS-255', 'Port container ETA alerts', 'Alert account managers when a container ETA slips by more than a day.', 'Vikram', 3,
+    [[null, 4 * D, 'Polling carrier API'], ['Blocked', 3 * D, 'Carrier API keys not issued yet']], 3 * D],
+  ['UI-60', 'Shipment list: sticky table header', 'Keep the header visible while scrolling long shipment lists.', 'Vikram', 3,
+    [[null, 26 * H], ['To Do', 20 * H, 'Parked until OPS-255 is unblocked']], 20 * H],
+];
+
+for (const [key, title, desc, who, appIdx, steps, lastAgo] of script) {
+  const person = people[who];
+  const [first, ...rest] = steps;
+  at(first[1]);
+  const { person: actor } = tr.recordActivity({ person, ticket: key, app: apps[appIdx], branch: `feature/${key}`, repo: 'logistics-platform', sessionId: `${key}-1` });
+  tr.setDetails(key, { title, description: desc }, 'jira');
+  if (first[2]) tr.addComment(key, first[2], actor, 'claude');
+  for (const [status, msAgo, note, summary] of rest) {
+    at(msAgo);
+    tr.changeStatus(key, status, { note, summary }, actor, 'claude');
+  }
+  if (lastAgo < first[1]) {
+    at(lastAgo);
+    const st = tr.getTask(key).status.category;
+    if (st !== 'done' && st !== 'todo') tr.recordActivity({ person, ticket: key, app: apps[appIdx], branch: `feature/${key}`, repo: 'logistics-platform', sessionId: `${key}-2` });
+  }
+}
+clock = Date.now();
+console.log(`Demo data written to ${file}`);
+console.log('Sign in with admin@localhost / demo-password');
