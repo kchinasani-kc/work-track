@@ -66,7 +66,7 @@ This builds a separate database in `data/demo-pg` with four developers and two w
 
 Vercel runs the app as a serverless function, so its data must live in a hosted database. Use Supabase's Postgres.
 
-1. **Create a Supabase project.** Pick the region closest to your Vercel functions; if your team is in India, that's Mumbai. In Vercel, set the function region to match (Project → Settings → Functions).
+1. **Create a Supabase project** in a region near your team. The app's functions must run in the same region, because every page makes several database trips. `vercel.json` pins them to Seoul (`icn1`) to match this project's Supabase region (`ap-northeast-2`). If your Supabase project is elsewhere, change `regions` in `vercel.json` to the matching [Vercel region](https://vercel.com/docs/edge-network/regions).
 2. **Copy the connection string.** In Supabase, click **Connect** and copy the **Transaction pooler** string. It looks like this, with your database password filled in:
 
    ```
