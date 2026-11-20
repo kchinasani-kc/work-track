@@ -77,9 +77,9 @@ before(async () => {
     res.end('{"errorMessages":["Issue does not exist"]}');
   });
   const jiraUrl = await listen(jiraServer);
-  const made = createApp({ dbFile: ':memory:', jira: createJiraClient({ baseUrl: jiraUrl, email: 'bot@example.com', token: 'jira-test-token' }) });
-  tracker = made.tracker;
-  teamKey = tracker.getSettings().team_key;
+  const made = createApp({ database: { memory: true }, jira: createJiraClient({ baseUrl: jiraUrl, email: 'bot@example.com', token: 'jira-test-token' }) });
+  ({ tracker } = await made.init());
+  teamKey = (await tracker.getSettings()).team_key;
   trackerServer = http.createServer(made.app);
   base = await listen(trackerServer);
   repo = gitRepo('feature/PROJ-7');
@@ -99,7 +99,7 @@ test('hook: ping records the ticket, person and app, and fills the title from Ji
   assert.equal(r.status, 0, r.stderr);
   assert.equal(r.stdout, '', 'ping must print nothing (stdout becomes Claude context)');
   let t;
-  for (let i = 0; i < 40 && !(t = tracker.getTask('PROJ-7')).title; i++) await sleep(50);
+  for (let i = 0; i < 40 && !(t = await tracker.getTask('PROJ-7')).title; i++) await sleep(50);
   assert.equal(t.title, 'Login redirect loop');
   assert.match(t.description, /Users bounce between \/login and \/home\.\n\n- Happens on Safari\n- Started after 2\.4/);
   assert.equal(t.assignee.email, 'priya@example.com');
@@ -115,7 +115,7 @@ test('hook: context line on a ticket branch; silent elsewhere or when misconfigu
   const ctx = await runHook('context', { cwd: repo, hook_event_name: 'SessionStart', source: 'startup' });
   assert.equal(ctx.status, 0);
   assert.match(ctx.stdout, /this session is on Jira ticket PROJ-7 \(branch feature\/PROJ-7\)/);
-  const before = tracker.listTasks().length;
+  const before = (await tracker.listTasks()).length;
   const off = await runHook('ping', { cwd: otherRepo, session_id: 's' });
   assert.equal(off.status, 0);
   assert.equal(off.stdout, '');
@@ -125,7 +125,7 @@ test('hook: context line on a ticket branch; silent elsewhere or when misconfigu
   assert.equal(down.status, 0);
   const garbage = await runPy([HOOK, 'ping'], 'not json', { PATH: process.env.PATH });
   assert.equal(garbage.status, 0);
-  assert.equal(tracker.listTasks().length, before);
+  assert.equal((await tracker.listTasks()).length, before);
 });
 
 test('MCP server: Claude reads and updates the ticket as the git user', async () => {
@@ -169,10 +169,10 @@ test('MCP server: Claude reads and updates the ticket as the git user', async ()
   assert.match(text(await call('team_tickets', { person: 'priya' })), /OPS-1/);
   await client.close();
 
-  const t = tracker.getTask('PROJ-7');
+  const t = await tracker.getTask('PROJ-7');
   assert.equal(t.status.name, 'Done');
   assert.ok(t.events.filter((e) => e.source === 'claude').every((e) => e.actor_name === 'Priya Sharma'));
-  assert.equal(tracker.getTask('OPS-1').details_source, 'claude');
+  assert.equal((await tracker.getTask('OPS-1')).details_source, 'claude');
   assert.ok(jiraRequests.every((q) => q.method === 'GET'));
 });
 

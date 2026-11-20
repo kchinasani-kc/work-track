@@ -77,12 +77,12 @@ export function createJiraClient({ baseUrl, email, token, fetchImpl = fetch, tim
 export async function refreshFromJira(tracker, jira, key, { force = false } = {}) {
   if (!jira) return null;
   try {
-    if (!force && !tracker.needsDetails(key)) return null;
+    if (!force && !(await tracker.needsDetails(key))) return null;
     const r = await jira.getIssue(key);
-    return tracker.setDetails(key, r, 'jira');
+    return await tracker.setDetails(key, r, 'jira');
   } catch (err) {
     try {
-      return tracker.setDetails(key, { error: `Could not reach Jira: ${err.message}` }, 'jira');
+      return await tracker.setDetails(key, { error: `Could not reach Jira: ${err.message}` }, 'jira');
     } catch {
       return null;
     }

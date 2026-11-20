@@ -2,22 +2,26 @@
   "name": "work-tracking",
   "version": "1.0.0",
   "private": true,
-  "description": "Team task tracker: manager dashboard + MCP endpoint so Claude can update task status",
+  "description": "Team task tracker: Jira tickets worked on in Claude Code, with status and waiting time for the manager",
   "type": "module",
   "engines": {
-    "node": ">=22.13"
+    "node": "22.x"
   },
   "scripts": {
-    "start": "node --disable-warning=ExperimentalWarning src/server.js",
-    "dev": "node --disable-warning=ExperimentalWarning --watch src/server.js",
-    "demo": "node --disable-warning=ExperimentalWarning scripts/demo.js && DB_FILE=data/demo.db node --disable-warning=ExperimentalWarning src/server.js",
-    "admin": "node --disable-warning=ExperimentalWarning scripts/admin.js",
-    "test": "node --disable-warning=ExperimentalWarning --test test/*.test.js"
+    "start": "node --env-file-if-exists=.env src/server.js",
+    "dev": "node --env-file-if-exists=.env --watch src/server.js",
+    "demo": "node scripts/demo.js && LOCAL_DB_DIR=data/demo-pg node src/server.js",
+    "admin": "node --env-file-if-exists=.env scripts/admin.js",
+    "test": "node --test test/*.test.js",
+    "db:check": "node --env-file-if-exists=.env scripts/db-check.js"
   },
   "dependencies": {
-    "express": "^5.2.1"
+    "@electric-sql/pglite": "^0.5.15",
+    "express": "^5.2.1",
+    "postgres": "^3.4.9"
   },
   "devDependencies": {
+    "@electric-sql/pglite-socket": "^0.2.18",
     "@modelcontextprotocol/sdk": "^1.32.2"
   }
 }

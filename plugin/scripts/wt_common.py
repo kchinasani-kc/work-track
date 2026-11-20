@@ -92,7 +92,7 @@ def app_info():
     }
 
 
-def post(path, body, timeout=6):
+def post(path, body, timeout=20):
     url, key = config()
     if not (url and key):
         raise TrackerError(

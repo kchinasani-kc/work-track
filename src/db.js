@@ -1,109 +1,106 @@
-import { DatabaseSync } from 'node:sqlite';
+// Database layer: Postgres everywhere.
+//  - Production (Vercel + Supabase): set DATABASE_URL to Supabase's transaction-pooler
+//    connection string; queries go through postgres.js with prepared statements off.
+//  - Local runs, the demo and tests: an embedded Postgres (PGlite), no server needed.
+//
+// Every table lives in the `wt` schema and is always schema-qualified, because a
+// transaction pooler doesn't keep session settings like search_path between requests.
+import { AsyncLocalStorage } from 'node:async_hooks';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 
-const SCHEMA_VERSION = 2;
+const SCHEMA_VERSION = '3';
+const INIT_LOCK = 72747_2026; // advisory lock key so parallel cold starts don't race the setup
 
-// All timestamps are UTC epoch milliseconds.
-const SCHEMA = `
-CREATE TABLE IF NOT EXISTS settings (
-  key   TEXT PRIMARY KEY,
-  value TEXT NOT NULL
-);
-
--- People are identified by their git email. Team members are created automatically
--- the first time their Claude Code reports work; managers also get a dashboard password.
-CREATE TABLE IF NOT EXISTS users (
-  id            INTEGER PRIMARY KEY,
-  name          TEXT NOT NULL,
-  email         TEXT NOT NULL UNIQUE COLLATE NOCASE,
-  role          TEXT NOT NULL DEFAULT 'member' CHECK (role IN ('member', 'manager')),
-  active        INTEGER NOT NULL DEFAULT 1,
-  name_locked   INTEGER NOT NULL DEFAULT 0,  -- 1 once a manager renames them; git name no longer overrides
-  password_hash TEXT,
-  last_seen_at  INTEGER,
-  last_app      TEXT,
-  created_at    INTEGER NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS sessions (
-  id         TEXT PRIMARY KEY,           -- sha256 of the cookie value
-  user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  expires_at INTEGER NOT NULL
-);
-
--- Statuses are referenced by id everywhere, so renaming one never rewrites history.
--- They are archived, never deleted, because task_events point at them.
-CREATE TABLE IF NOT EXISTS statuses (
-  id               INTEGER PRIMARY KEY,
-  name             TEXT NOT NULL UNIQUE COLLATE NOCASE,
-  color            TEXT NOT NULL DEFAULT '#64748b',
-  category         TEXT NOT NULL CHECK (category IN ('todo', 'active', 'blocked', 'done')),
-  position         INTEGER NOT NULL,
-  stuck_after_days REAL,                 -- NULL = use default, 0 = never flag as stuck
-  archived         INTEGER NOT NULL DEFAULT 0,
-  created_at       INTEGER NOT NULL
-);
-
--- One row per Jira ticket someone has worked on in Claude Code. Title and description
--- are copied from Jira (read-only); status and work summary belong to the tracker.
-CREATE TABLE IF NOT EXISTS tasks (
-  id                 INTEGER PRIMARY KEY,
-  jira_key           TEXT NOT NULL UNIQUE COLLATE NOCASE,
-  title              TEXT,
-  description        TEXT NOT NULL DEFAULT '',
-  details_source     TEXT,               -- 'jira' | 'claude' | NULL (not loaded yet)
-  details_fetched_at INTEGER,
-  details_error      TEXT,
-  work_summary       TEXT,
-  summary_updated_at INTEGER,
-  assignee_id        INTEGER REFERENCES users(id),
-  status_id          INTEGER NOT NULL REFERENCES statuses(id),
-  created_at         INTEGER NOT NULL,
-  updated_at         INTEGER NOT NULL,
-  status_changed_at  INTEGER NOT NULL,
-  closed_at          INTEGER,
-  last_activity_at   INTEGER
-);
-CREATE INDEX IF NOT EXISTS tasks_assignee ON tasks(assignee_id);
-CREATE INDEX IF NOT EXISTS tasks_status ON tasks(status_id);
-
--- Append-only log. A 'created' event carries the initial status so time in the
--- first status can be measured; every later status change is a 'status' event.
-CREATE TABLE IF NOT EXISTS task_events (
-  id             INTEGER PRIMARY KEY,
-  task_id        INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
-  kind           TEXT NOT NULL CHECK (kind IN ('created', 'status', 'assigned', 'comment', 'summary')),
-  from_status_id INTEGER REFERENCES statuses(id),
-  to_status_id   INTEGER REFERENCES statuses(id),
-  from_user_id   INTEGER REFERENCES users(id),
-  to_user_id     INTEGER REFERENCES users(id),
-  actor_id       INTEGER REFERENCES users(id),
-  source         TEXT NOT NULL CHECK (source IN ('claude', 'hook', 'web', 'system')),
-  note           TEXT,
-  created_at     INTEGER NOT NULL
-);
-CREATE INDEX IF NOT EXISTS task_events_task ON task_events(task_id, created_at);
-
--- Claude Code sessions seen working on a ticket ("who is on it right now, in which app").
-CREATE TABLE IF NOT EXISTS activity (
-  id         INTEGER PRIMARY KEY,
-  task_id    INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
-  user_id    INTEGER NOT NULL REFERENCES users(id),
-  session_id TEXT NOT NULL,
-  app        TEXT,
-  app_raw    TEXT,
-  repo       TEXT,
-  branch     TEXT,
-  first_at   INTEGER NOT NULL,
-  last_at    INTEGER NOT NULL,
-  pings      INTEGER NOT NULL DEFAULT 1,
-  UNIQUE (session_id, task_id)
-);
-CREATE INDEX IF NOT EXISTS activity_task ON activity(task_id, last_at);
-CREATE INDEX IF NOT EXISTS activity_user ON activity(user_id, last_at);
-`;
+// One statement per entry (no multi-statement strings: the pooler path uses the extended protocol).
+const DDL = [
+  'CREATE SCHEMA IF NOT EXISTS wt',
+  `CREATE TABLE IF NOT EXISTS wt.settings (
+     key   text PRIMARY KEY,
+     value text NOT NULL)`,
+  // People are identified by their git email (stored lowercase). Team members are created
+  // automatically the first time their Claude Code reports work; managers also get a password.
+  `CREATE TABLE IF NOT EXISTS wt.users (
+     id            integer GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+     name          text NOT NULL,
+     email         text NOT NULL UNIQUE,
+     role          text NOT NULL DEFAULT 'member' CHECK (role IN ('member', 'manager')),
+     active        integer NOT NULL DEFAULT 1,
+     name_locked   integer NOT NULL DEFAULT 0,
+     password_hash text,
+     last_seen_at  bigint,
+     last_app      text,
+     created_at    bigint NOT NULL)`,
+  `CREATE TABLE IF NOT EXISTS wt.sessions (
+     id         text PRIMARY KEY,
+     user_id    integer NOT NULL REFERENCES wt.users(id) ON DELETE CASCADE,
+     expires_at bigint NOT NULL)`,
+  // Statuses are referenced by id everywhere, so renaming one never rewrites history.
+  `CREATE TABLE IF NOT EXISTS wt.statuses (
+     id               integer GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+     name             text NOT NULL,
+     color            text NOT NULL DEFAULT '#64748b',
+     category         text NOT NULL CHECK (category IN ('todo', 'active', 'blocked', 'done')),
+     position         integer NOT NULL,
+     stuck_after_days double precision,
+     archived         integer NOT NULL DEFAULT 0,
+     created_at       bigint NOT NULL)`,
+  'CREATE UNIQUE INDEX IF NOT EXISTS statuses_name_ci ON wt.statuses (lower(name))',
+  // One row per Jira ticket someone has worked on. Title/description are copied from Jira
+  // (read-only); status and work summary belong to the tracker. jira_key is stored uppercase.
+  `CREATE TABLE IF NOT EXISTS wt.tasks (
+     id                 integer GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+     jira_key           text NOT NULL UNIQUE,
+     title              text,
+     description        text NOT NULL DEFAULT '',
+     details_source     text,
+     details_fetched_at bigint,
+     details_error      text,
+     work_summary       text,
+     summary_updated_at bigint,
+     assignee_id        integer REFERENCES wt.users(id),
+     status_id          integer NOT NULL REFERENCES wt.statuses(id),
+     created_at         bigint NOT NULL,
+     updated_at         bigint NOT NULL,
+     status_changed_at  bigint NOT NULL,
+     closed_at          bigint,
+     last_activity_at   bigint)`,
+  'CREATE INDEX IF NOT EXISTS tasks_assignee ON wt.tasks (assignee_id)',
+  'CREATE INDEX IF NOT EXISTS tasks_status ON wt.tasks (status_id)',
+  // Append-only log. A 'created' event carries the initial status so time in the first
+  // status can be measured; every later status change is a 'status' event.
+  `CREATE TABLE IF NOT EXISTS wt.task_events (
+     id             integer GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+     task_id        integer NOT NULL REFERENCES wt.tasks(id) ON DELETE CASCADE,
+     kind           text NOT NULL CHECK (kind IN ('created', 'status', 'assigned', 'comment', 'summary')),
+     from_status_id integer REFERENCES wt.statuses(id),
+     to_status_id   integer REFERENCES wt.statuses(id),
+     from_user_id   integer REFERENCES wt.users(id),
+     to_user_id     integer REFERENCES wt.users(id),
+     actor_id       integer REFERENCES wt.users(id),
+     source         text NOT NULL CHECK (source IN ('claude', 'hook', 'web', 'system')),
+     note           text,
+     created_at     bigint NOT NULL)`,
+  'CREATE INDEX IF NOT EXISTS task_events_task ON wt.task_events (task_id, created_at)',
+  // Claude Code sessions seen working on a ticket ("who is on it right now, in which app").
+  `CREATE TABLE IF NOT EXISTS wt.activity (
+     id         integer GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+     task_id    integer NOT NULL REFERENCES wt.tasks(id) ON DELETE CASCADE,
+     user_id    integer NOT NULL REFERENCES wt.users(id),
+     session_id text NOT NULL,
+     app        text,
+     app_raw    text,
+     repo       text,
+     branch     text,
+     first_at   bigint NOT NULL,
+     last_at    bigint NOT NULL,
+     pings      integer NOT NULL DEFAULT 1,
+     UNIQUE (session_id, task_id))`,
+  'CREATE INDEX IF NOT EXISTS activity_task ON wt.activity (task_id, last_at)',
+  'CREATE INDEX IF NOT EXISTS activity_user ON wt.activity (user_id, last_at)',
+];
+const TABLES = ['settings', 'users', 'sessions', 'statuses', 'tasks', 'task_events', 'activity'];
 
 const DEFAULT_STATUSES = [
   { name: 'To Do', color: '#64748b', category: 'todo', stuck_after_days: null },
@@ -115,51 +112,131 @@ const DEFAULT_STATUSES = [
 
 const DEFAULT_SETTINGS = {
   default_stuck_days: '3',
-  active_minutes: '30',      // a ticket counts as "being worked on now" this long after the last Claude activity
-  jira_project_keys: '',     // comma-separated; empty = accept any KEY-123 found in a branch name
+  active_minutes: '30', // a ticket counts as "being worked on now" this long after the last Claude activity
+  jira_project_keys: '', // comma-separated; empty = accept any uppercase KEY-123 found in a branch name
 };
 
-export function openDb(file) {
-  if (file !== ':memory:') fs.mkdirSync(path.dirname(path.resolve(file)), { recursive: true });
-  const db = new DatabaseSync(file);
-  db.exec('PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;');
-  const { user_version: version } = db.prepare('PRAGMA user_version').get();
-  if (version !== 0 && version !== SCHEMA_VERSION) {
-    throw new Error(
-      `${file} was created by an older version of Work Tracker (schema ${version}). ` +
-        'It only holds trial data from before the Jira switch: move it aside and start again.'
-    );
-  }
-  db.exec(SCHEMA);
-  db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
-  seed(db);
-  return db;
+/** `?` placeholders -> `$1, $2, ...` (none of our SQL has a literal question mark). */
+const toPg = (sql) => {
+  let i = 0;
+  return sql.replace(/\?/g, () => `$${++i}`);
+};
+
+/**
+ * Wrap a backend ({ query, begin, close }) in the small API the app uses:
+ * get / all / run / tx. Inside tx(fn), every query made by fn (however deep) goes
+ * through the transaction's connection, via AsyncLocalStorage.
+ */
+function wrap(base, kind) {
+  const als = new AsyncLocalStorage();
+  const handle = () => als.getStore() ?? base;
+  const q = (sql, params) => handle().query(toPg(sql), params);
+  return {
+    kind,
+    all: (sql, ...params) => q(sql, params),
+    get: async (sql, ...params) => (await q(sql, params))[0],
+    run: (sql, ...params) => q(sql, params),
+    tx: (fn) => (als.getStore() ? fn() : base.begin((h) => als.run(h, fn))),
+    close: () => base.close(),
+  };
 }
 
-function seed(db) {
-  const now = Date.now();
-  const insertSetting = db.prepare('INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)');
-  for (const [k, v] of Object.entries(DEFAULT_SETTINGS)) insertSetting.run(k, v);
-  insertSetting.run('team_key', `wtk_${crypto.randomBytes(18).toString('base64url')}`);
-
-  const { n } = db.prepare('SELECT COUNT(*) AS n FROM statuses').get();
-  if (n === 0) {
-    const insert = db.prepare(
-      'INSERT INTO statuses (name, color, category, position, stuck_after_days, created_at) VALUES (?, ?, ?, ?, ?, ?)'
-    );
-    DEFAULT_STATUSES.forEach((s, i) => insert.run(s.name, s.color, s.category, i + 1, s.stuck_after_days, now));
-  }
-}
-
-/** Run fn inside a transaction; rolls back if it throws. */
-export function tx(db, fn) {
-  db.exec('BEGIN IMMEDIATE');
+/**
+ * Percent-encode the password inside a connection string, so a password containing
+ * @ / ? # % works as pasted from Supabase. Already-encoded passwords are left alone.
+ */
+export function normalizeDbUrl(url) {
+  const m = String(url ?? '').trim().match(/^(postgres(?:ql)?:\/\/)([^:/@]+):(.*)@([^@/?#]+)(\/[^@]*)?$/s);
+  if (!m) return String(url ?? '').trim();
+  const [, scheme, user, rawPass, host, rest = ''] = m;
+  let pass = rawPass;
   try {
-    const result = fn();
-    db.exec('COMMIT');
-    return result;
-  } catch (err) {
-    db.exec('ROLLBACK');
-    throw err;
+    if (encodeURIComponent(decodeURIComponent(rawPass)) !== rawPass) pass = encodeURIComponent(rawPass);
+  } catch {
+    pass = encodeURIComponent(rawPass); // a lone % that isn't an escape
   }
+  return `${scheme}${user}:${pass}@${host}${rest}`;
+}
+
+const isLocalHost = (url) => /@(localhost|127\.0\.0\.1|\[::1\])(:\d+)?\//.test(url) || /^postgres(ql)?:\/\/(localhost|127\.0\.0\.1)/.test(url);
+
+async function postgresBackend(rawUrl, { max } = {}) {
+  const { default: postgres } = await import('postgres');
+  const url = normalizeDbUrl(rawUrl);
+  const sql = postgres(url, {
+    prepare: false, // required by Supabase's transaction pooler
+    max: max ?? Number(process.env.DB_POOL_MAX ?? 3),
+    idle_timeout: 20,
+    connect_timeout: 15,
+    ssl: isLocalHost(url) ? false : 'require',
+    onnotice: () => {},
+    types: { bigint: { to: 20, from: [20], serialize: (x) => String(x), parse: (x) => Number(x) } },
+  });
+  const runner = (s) => ({ query: async (text, params) => [...(await s.unsafe(text, params ?? []))] });
+  return wrap({ ...runner(sql), begin: (fn) => sql.begin((t) => fn(runner(t))), close: () => sql.end({ timeout: 5 }) }, 'postgres');
+}
+
+async function pgliteBackend(dataDir) {
+  const { PGlite, types } = await import('@electric-sql/pglite');
+  if (dataDir) fs.mkdirSync(path.resolve(dataDir), { recursive: true });
+  const pg = new PGlite(dataDir ? path.resolve(dataDir) : undefined, { parsers: { [types.INT8]: (v) => Number(v) } });
+  await pg.waitReady;
+  const runner = (p) => ({ query: async (text, params) => (await p.query(text, params ?? [])).rows });
+  return wrap({ ...runner(pg), begin: (fn) => pg.transaction((t) => fn(runner(t))), close: () => pg.close() }, 'pglite');
+}
+
+/**
+ * Open the database.
+ *   { url }      Postgres connection string (Supabase in production)
+ *   { dataDir }  embedded Postgres stored in a folder (local runs, demo)
+ *   { memory }   embedded Postgres in memory (tests)
+ */
+export async function connect({ url, dataDir, memory, max } = {}) {
+  if (url) return postgresBackend(url, { max });
+  if (memory) return pgliteBackend(null);
+  return pgliteBackend(dataDir ?? 'data/pgdata');
+}
+
+/** Create tables and defaults if they aren't there yet. Safe to run on every cold start. */
+export async function migrate(db) {
+  const ready = await db.get(
+    "SELECT to_regclass('wt.settings') IS NOT NULL AS has_table"
+  );
+  if (ready?.has_table) {
+    const v = await db.get("SELECT value FROM wt.settings WHERE key = 'schema_version'");
+    if (v?.value === SCHEMA_VERSION) return;
+  }
+  await db.tx(async () => {
+    await db.run('SELECT pg_advisory_xact_lock(?)', INIT_LOCK);
+    for (const stmt of DDL) await db.run(stmt);
+    for (const t of TABLES) await db.run(`ALTER TABLE wt.${t} ENABLE ROW LEVEL SECURITY`);
+    // Supabase's public API roles: make sure they can't read anything here (we never use them).
+    const roles = await db.all("SELECT rolname FROM pg_roles WHERE rolname IN ('anon', 'authenticated')");
+    for (const { rolname } of roles) {
+      await db.run(`REVOKE ALL ON ALL TABLES IN SCHEMA wt FROM ${rolname}`);
+      await db.run(`REVOKE USAGE ON SCHEMA wt FROM ${rolname}`);
+    }
+    const now = Date.now();
+    for (const [k, v] of Object.entries(DEFAULT_SETTINGS)) {
+      await db.run('INSERT INTO wt.settings (key, value) VALUES (?, ?) ON CONFLICT (key) DO NOTHING', k, v);
+    }
+    await db.run(
+      'INSERT INTO wt.settings (key, value) VALUES (?, ?) ON CONFLICT (key) DO NOTHING',
+      'team_key', `wtk_${crypto.randomBytes(18).toString('base64url')}`
+    );
+    const { n } = await db.get('SELECT COUNT(*) AS n FROM wt.statuses');
+    if (n === 0) {
+      let pos = 1;
+      for (const s of DEFAULT_STATUSES) {
+        await db.run(
+          'INSERT INTO wt.statuses (name, color, category, position, stuck_after_days, created_at) VALUES (?, ?, ?, ?, ?, ?)',
+          s.name, s.color, s.category, pos++, s.stuck_after_days, now
+        );
+      }
+    }
+    await db.run(
+      "INSERT INTO wt.settings (key, value) VALUES ('schema_version', ?) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+      SCHEMA_VERSION
+    );
+  });
 }

@@ -38,37 +38,41 @@ export function apiRouter(tracker, { secureCookies = false, publicUrl = null, ji
     }
   };
 
-  r.post('/login', wrap((req, res) => {
-    const { sid, user, maxAgeMs } = tracker.login(req.body?.email, req.body?.password);
+  r.post('/login', wrap(async (req, res) => {
+    const { sid, user, maxAgeMs } = await tracker.login(req.body?.email, req.body?.password);
     res.cookie(COOKIE, sid, { httpOnly: true, sameSite: 'lax', secure: secureCookies, maxAge: maxAgeMs, path: '/' });
     return { user };
   }));
 
-  r.post('/logout', wrap((req, res) => {
-    tracker.logout(readCookie(req, COOKIE));
+  r.post('/logout', wrap(async (req, res) => {
+    await tracker.logout(readCookie(req, COOKIE));
     res.clearCookie(COOKIE, { path: '/' });
   }));
 
   // Everything below needs a signed-in manager.
-  r.use((req, res, next) => {
-    const user = tracker.sessionUser(readCookie(req, COOKIE));
-    if (!user) return res.status(401).json({ error: 'sign in required' });
-    req.user = user;
-    next();
+  r.use(async (req, res, next) => {
+    try {
+      const user = await tracker.sessionUser(readCookie(req, COOKIE));
+      if (!user || typeof user.id !== 'number') return res.status(401).json({ error: 'sign in required' });
+      req.user = user;
+      next();
+    } catch (err) {
+      next(err);
+    }
   });
 
   const q = (v) => (v === undefined || v === '' ? undefined : v);
 
   r.get('/me', wrap((req) => ({ user: req.user })));
 
-  r.get('/bootstrap', wrap((req) => ({
+  r.get('/bootstrap', wrap(async (req) => ({
     me: req.user,
-    settings: tracker.getSettings(),
+    settings: await tracker.getSettings(),
     public_url: publicUrl,
     plugin_source: pluginSource,
     jira: { configured: !!jira, base_url: jira?.baseUrl ?? null },
-    statuses: tracker.listStatuses(),
-    users: tracker.listUsers(),
+    statuses: await tracker.listStatuses(),
+    users: await tracker.listUsers(),
   })));
 
   // ---- tickets (read-only here: they come from Jira, status comes from Claude) ----
@@ -105,14 +109,14 @@ export function apiRouter(tracker, { secureCookies = false, publicUrl = null, ji
   r.get('/users', wrap(() => tracker.listUsers()));
   r.post('/users', wrap((req) => tracker.createManager({ name: req.body?.name, email: req.body?.email, password: req.body?.password })));
   r.patch('/users/:id', wrap((req) => tracker.updateUser(Number(req.params.id), req.body ?? {})));
-  r.post('/users/:id/password', wrap((req) => {
-    tracker.setPassword(Number(req.params.id), req.body?.password);
+  r.post('/users/:id/password', wrap(async (req) => {
+    await tracker.setPassword(Number(req.params.id), req.body?.password);
   }));
 
   // ---- settings ----
   r.get('/settings', wrap(() => tracker.getSettings()));
   r.patch('/settings', wrap((req) => tracker.updateSettings(req.body ?? {})));
-  r.post('/settings/team-key', wrap(() => ({ team_key: tracker.regenerateTeamKey() })));
+  r.post('/settings/team-key', wrap(async () => ({ team_key: await tracker.regenerateTeamKey() })));
 
   r.use((req, res) => res.status(404).json({ error: 'not found' }));
   return r;

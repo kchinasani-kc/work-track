@@ -3,21 +3,23 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { openDb } from '../src/db.js';
+import { connect, migrate } from '../src/db.js';
 import { createTracker } from '../src/service.js';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const file = path.join(root, 'data', 'demo.db');
-for (const f of [file, `${file}-wal`, `${file}-shm`]) fs.rmSync(f, { force: true });
+const dir = path.join(root, 'data', 'demo-pg');
+fs.rmSync(dir, { recursive: true, force: true });
 
 const H = 3_600_000;
 const D = 24 * H;
 let clock = Date.now() - 14 * D;
-const tr = createTracker(openDb(file), { now: () => clock });
+const db = await connect({ dataDir: dir });
+await migrate(db);
+const tr = createTracker(db, { now: () => clock });
 const at = (msAgo) => { clock = Date.now() - msAgo; };
 
-tr.ensureManager({ email: 'admin@localhost', password: 'demo-password' });
-tr.updateSettings({ jira_project_keys: 'PORT,FIN,OPS,UI' });
+await tr.ensureManager({ email: 'admin@localhost', password: 'demo-password' });
+await tr.updateSettings({ jira_project_keys: 'PORT,FIN,OPS,UI' });
 const people = {
   Priya: { name: 'Priya Sharma', email: 'priya@example.com' },
   Arjun: { name: 'Arjun Mehta', email: 'arjun@example.com' },
@@ -52,19 +54,20 @@ for (const [key, title, desc, who, appIdx, steps, lastAgo] of script) {
   const person = people[who];
   const [first, ...rest] = steps;
   at(first[1]);
-  const { person: actor } = tr.recordActivity({ person, ticket: key, app: apps[appIdx], branch: `feature/${key}`, repo: 'logistics-platform', sessionId: `${key}-1` });
-  tr.setDetails(key, { title, description: desc }, 'jira');
-  if (first[2]) tr.addComment(key, first[2], actor, 'claude');
+  const { person: actor } = await tr.recordActivity({ person, ticket: key, app: apps[appIdx], branch: `feature/${key}`, repo: 'logistics-platform', sessionId: `${key}-1` });
+  await tr.setDetails(key, { title, description: desc }, 'jira');
+  if (first[2]) await tr.addComment(key, first[2], actor, 'claude');
   for (const [status, msAgo, note, summary] of rest) {
     at(msAgo);
-    tr.changeStatus(key, status, { note, summary }, actor, 'claude');
+    await tr.changeStatus(key, status, { note, summary }, actor, 'claude');
   }
   if (lastAgo < first[1]) {
     at(lastAgo);
-    const st = tr.getTask(key).status.category;
-    if (st !== 'done' && st !== 'todo') tr.recordActivity({ person, ticket: key, app: apps[appIdx], branch: `feature/${key}`, repo: 'logistics-platform', sessionId: `${key}-2` });
+    const st = (await tr.getTask(key)).status.category;
+    if (st !== 'done' && st !== 'todo') await tr.recordActivity({ person, ticket: key, app: apps[appIdx], branch: `feature/${key}`, repo: 'logistics-platform', sessionId: `${key}-2` });
   }
 }
 clock = Date.now();
-console.log(`Demo data written to ${file}`);
+await db.close();
+console.log(`Demo data written to ${dir}`);
 console.log('Sign in with admin@localhost / demo-password');

@@ -37,9 +37,11 @@ The manager sees five pages:
 - **Tools.** The plugin's tools let Claude update the ticket. The server instructions tell Claude to do this on its own: move the ticket to review, blocked or done as the work goes, with a one-line note, and write a 2–4 sentence summary when it's done. Moving to a done status is refused without a summary.
 - **Attribution.** Every change is kept in an append-only history: who made it (their git identity), when, the note, and whether it came from Claude, from automatic detection, or from the dashboard. Waiting times are calculated from that history.
 
-## Quick start
+## Quick start (on your own computer)
 
-Requires Node.js 22.13 or newer. It uses Node's built-in SQLite, so there is nothing to compile. The plugin needs `python3` and `git` on each developer's machine; the Python that ships with macOS is enough.
+Requires Node.js 20 or newer. The plugin needs `python3` and `git` on each developer's machine; the Python that ships with macOS is enough.
+
+The tracker stores its data in Postgres. In production that's Supabase, covered in the next section. On your own computer, without a `DATABASE_URL`, it uses an embedded Postgres kept in `data/pgdata`, with nothing to install or run:
 
 ```bash
 npm install
@@ -58,7 +60,34 @@ On first start it creates a manager login and prints it. To choose it yourself, 
 npm run demo
 ```
 
-This builds a separate `data/demo.db` with four developers and two weeks of history, then starts the server. Sign in with `admin@localhost` / `demo-password`. Your real data in `data/tracker.db` is not touched.
+This builds a separate database in `data/demo-pg` with four developers and two weeks of history, then starts the server. Sign in with `admin@localhost` / `demo-password`. Your other data is not touched.
+
+## Deploying on Vercel with Supabase
+
+Vercel runs the app as a serverless function, so its data must live in a hosted database. Use Supabase's Postgres.
+
+1. **Create a Supabase project.** Pick the region closest to your Vercel functions; if your team is in India, that's Mumbai. In Vercel, set the function region to match (Project → Settings → Functions).
+2. **Copy the connection string.** In Supabase, click **Connect** and copy the **Transaction pooler** string. It looks like this, with your database password filled in:
+
+   ```
+   postgresql://postgres.<project-ref>:<password>@aws-0-<region>.pooler.supabase.com:6543/postgres
+   ```
+
+   Use the transaction pooler (port 6543), not the direct connection; it's the one meant for serverless. If the database password contains `@`, `#`, `/`, `?` or `%`, URL-encode it (for example `@` becomes `%40`), or reset it in Supabase to letters and digits.
+3. **Add environment variables in Vercel** (Project → Settings → Environment Variables), then redeploy:
+
+   | Variable | Value |
+   | --- | --- |
+   | `DATABASE_URL` | the pooler string from step 2 |
+   | `ADMIN_EMAIL`, `ADMIN_PASSWORD` | the first manager login (8+ character password). Required on Vercel, where a generated password couldn't be shown to you |
+   | `PLUGIN_SOURCE` | `kchinasani-kc/work-track`, shown in the Connect page's commands |
+   | `JIRA_BASE_URL`, `JIRA_EMAIL`, `JIRA_API_TOKEN` | optional, read-only Jira access |
+
+4. **Sign in.** Open the site and sign in with `ADMIN_EMAIL` / `ADMIN_PASSWORD`. Change the password under **People** if you like; the environment variable is only used while no manager exists.
+
+On the first request, the app creates its tables in a separate `wt` schema, so they can't clash with anything else in the Supabase project. Supabase's public data API can't reach them, and row-level security is on. If something is misconfigured, `/healthz` and the dashboard show the reason, for example a missing `DATABASE_URL` or a wrong password in it.
+
+The site's address goes into each person's plugin. Vercel's production URL is picked up automatically; set `PUBLIC_URL` to use a custom domain instead.
 
 ## Reading Jira (optional, read-only)
 
@@ -174,40 +203,34 @@ A ticket's history starts with a "started" entry when it is first worked on, and
 ## Things to know
 
 - **A parked ticket stays parked.** If Claude moves a ticket to a to-do status, it stays there for the rest of that session. It restarts when a new Claude Code session begins on the ticket's branch.
+- **Supabase's free tier pauses idle projects.** After about a week with no activity, the dashboard shows a "can't start" error until you restore the project in Supabase. Daily use keeps it awake; a paid plan never pauses.
 - **The team key is shared.** Anyone who has it can report work under any git email. Share it only with the team. **Make a new key** on Connect if it leaks; everyone then reinstalls with the new key.
 - **App names are best effort.** Claude Code doesn't document a way to tell its apps apart. The tracker reads the environment the plugin runs in, and keeps the raw values on each session in the ticket's details. In testing, the desktop app reported correctly. VS Code and Cursor haven't been checked yet.
 - **People are matched by exact git email.** Someone who commits with two emails shows up as two people. You can rename people, but not merge them.
 - **When someone else picks up a ticket**, for example a reviewer working on the same branch, the ticket moves to their lane, and the history records the hand-over.
 
-## Running it for the team
+## Settings reference
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `PORT` | `4000` | Port to listen on |
-| `HOST` | `127.0.0.1` | Set to `0.0.0.0` so teammates' Claude Code can reach it |
-| `PUBLIC_URL` | `http://HOST:PORT` | The address teammates use. It goes into the commands on Connect. When it starts with `https://`, the sign-in cookie is marked secure |
-| `PLUGIN_SOURCE` | none | Git address or path of this repo, shown in the Connect commands |
+| `DATABASE_URL` | none | Postgres connection string (Supabase transaction pooler). Without it, a local run uses the embedded database; on Vercel it's required |
+| `ADMIN_EMAIL`, `ADMIN_PASSWORD` | `admin@localhost`, random (local only) | First manager login, used only while no manager can sign in |
+| `PUBLIC_URL` | Vercel's production URL, or `http://HOST:PORT` | The address teammates use. It goes into the commands on Connect |
+| `PLUGIN_SOURCE` | none | Git address of this repo, shown in the Connect commands |
 | `JIRA_BASE_URL`, `JIRA_EMAIL`, `JIRA_API_TOKEN` | none | Read-only Jira access for titles and descriptions |
-| `DB_FILE` | `data/tracker.db` | SQLite database file |
-| `ADMIN_EMAIL`, `ADMIN_PASSWORD` | `admin@localhost`, random | First manager login, used only when no manager can sign in |
+| `PORT`, `HOST` | `4000`, `127.0.0.1` | Local runs only. Set `HOST=0.0.0.0` to let others on the network reach it |
+| `LOCAL_DB_DIR` | `data/pgdata` | Folder for the embedded database (local runs only) |
+| `DB_POOL_MAX` | `3` | Connections per server instance to `DATABASE_URL` |
 
-For a shared install:
+**Backups.** On Supabase, use its built-in daily backups (Project → Database → Backups), or `pg_dump` with the direct connection string. Locally, copy `data/pgdata` while the server is stopped.
 
-- Run it on a machine everyone can reach, with `HOST=0.0.0.0` and `PUBLIC_URL` set to that machine's address.
-- Keep it running with a process manager: systemd, pm2, or a Windows service.
-- Put it behind HTTPS (nginx, Caddy or IIS) so the team key and passwords aren't sent in plain text.
-
-**Backups.** All data lives in one SQLite file. To take a live copy:
+**Locked out?** Reset or create a manager login from any machine:
 
 ```bash
-sqlite3 data/tracker.db ".backup data/backup.db"
+DATABASE_URL='<your connection string>' npm run admin -- reset-password you@company.com 'new-password'
 ```
 
-**Locked out?** Reset a manager password from the server machine:
-
-```bash
-npm run admin -- reset-password you@company.com 'new-password'
-```
+Without `DATABASE_URL` it works on the local embedded database; stop the local server first.
 
 **Plugin not reporting?** Each developer's plugin writes a short log to `~/.claude/plugins/data/work-tracker-work-tracker/work-tracker.log`. It shows the tracker address it is using, whether the key is set, and any errors such as a wrong team key or an unreachable server.
 
@@ -225,7 +248,10 @@ npm run dev
 
 The tests cover:
 
-- time-in-status maths, the summary rule, custom statuses, project-key filtering and auth
+- time-in-status maths, the summary rule, custom statuses, project-key filtering, search and auth
+- two simultaneous first reports for a new ticket creating it exactly once
+- the HTTP auth guards: wrong team key, no session and wrong password are refused
+- the production database driver (postgres.js, as used with Supabase), run over the Postgres network protocol against an embedded Postgres
 - the real plugin scripts end to end:
   - the hook and tool server run against a live tracker and a fake read-only Jira
   - inside a throwaway git repo on a ticket branch
@@ -242,7 +268,8 @@ src/service.js     tickets, statuses, people, history and reports
 src/claudeApi.js   API the plugin calls (team key + git identity)
 src/api.js         dashboard API (manager sessions)
 src/jira.js        read-only Jira lookup
-src/db.js          schema and default statuses
+src/db.js          Postgres connection (Supabase or embedded), schema and default statuses
+src/server.js      entry point for `npm start` and for Vercel (default-exported app)
 public/            dashboard (plain HTML, CSS and JS; no build step)
 plugin/            the Claude Code plugin: hooks, MCP tool server, manifest
 .claude-plugin/    marketplace file, so this repo can be added with `claude plugin marketplace add`

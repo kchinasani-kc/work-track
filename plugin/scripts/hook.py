@@ -58,7 +58,7 @@ def main():
                 "session_source": data.get("source"),
                 "app_info": wt.app_info(),
             },
-            timeout=5,
+            timeout=15,  # runs in the background; allows for a cold start on a serverless host
         )
     except wt.TrackerError as err:
         wt.log(f"{time.ctime()} {key}: {err}")

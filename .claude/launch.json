@@ -5,15 +5,27 @@
       "name": "work-tracker-demo",
       "runtimeExecutable": "node",
       "runtimeArgs": [
-        "--disable-warning=ExperimentalWarning",
         "src/server.js"
       ],
       "env": {
-        "DB_FILE": "data/demo.db",
         "PORT": "4100",
-        "PLUGIN_SOURCE": "/Users/kchinasani-kc/projects/office/work-tracking"
+        "PLUGIN_SOURCE": "/Users/kchinasani-kc/projects/office/work-tracking",
+        "LOCAL_DB_DIR": "data/demo-pg"
       },
       "port": 4100
+    },
+    {
+      "name": "work-tracker-supabase",
+      "runtimeExecutable": "node",
+      "runtimeArgs": [
+        "--env-file=.env",
+        "src/server.js"
+      ],
+      "env": {
+        "PORT": "4300",
+        "PLUGIN_SOURCE": "kchinasani-kc/work-track"
+      },
+      "port": 4300
     }
   ]
 }
